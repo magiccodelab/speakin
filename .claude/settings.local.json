@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__dev-doc-mcp__list_frameworks",
+      "mcp__dev-doc-mcp__search_docs",
+      "mcp__dev-doc-mcp__get_doc_outline",
+      "Bash(cargo check:*)",
+      "Bash(npx tsc:*)",
+      "WebSearch",
+      "Bash(cargo add:*)",
+      "Bash(cargo clippy:*)",
+      "WebFetch(domain:docs.rs)",
+      "Bash(cargo remove:*)",
+      "Bash(pnpm add:*)",
+      "Bash(wc:*)",
+      "Bash(grep -n \"tokio::\" /i/projects/voice-input-app/src-tauri/src/*.rs)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo build:*)"
+    ]
+  }
+}

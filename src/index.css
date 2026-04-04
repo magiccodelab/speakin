@@ -1,0 +1,313 @@
+@import "tailwindcss";
+
+/* ── Design Token System ── */
+
+@layer base {
+  :root {
+    color-scheme: light;
+
+    /* ── 表面层级 ── */
+    --bg:            220 20% 97%;
+    --bg-card:       0 0% 100%;
+    --bg-subtle:     220 15% 93%;
+    --bg-inset:      220 18% 91%;
+
+    /* ── 边框 ── */
+    --border:        220 15% 89%;
+    --border-strong: 220 15% 82%;
+
+    /* ── 文本层级 ── */
+    --fg:            220 20% 10%;
+    --fg-2:          220 12% 38%;
+    --fg-3:          220 10% 58%;
+
+    /* ── 品牌色 ── */
+    --primary:       221 83% 53%;
+    --primary-fg:    0 0% 100%;
+
+    /* ── 点缀色 ── */
+    --gold:          38 80% 48%;
+    --gold-fg:       0 0% 100%;
+
+    /* ── 状态色 ── */
+    --ok:            142 71% 32%;   --ok-muted:    142 60% 93%;   --ok-muted-fg:    142 71% 25%;
+    --warn:          38 90% 46%;    --warn-muted:  38 90% 93%;    --warn-muted-fg:  38 80% 30%;
+    --info:          205 85% 45%;   --info-muted:  205 80% 92%;   --info-muted-fg:  205 85% 30%;
+    --danger:        0 84% 60%;     --danger-muted: 0 70% 95%;    --danger-muted-fg: 0 84% 38%;
+    --danger-fg:     0 0% 100%;
+
+    /* ── 阴影 ── */
+    --shadow-color:  220 20% 10%;
+    --shadow-sm:     0 1px 2px hsl(var(--shadow-color) / 0.05);
+    --shadow-md:     0 4px 12px hsl(var(--shadow-color) / 0.08);
+    --shadow-lg:     0 10px 24px hsl(var(--shadow-color) / 0.12);
+
+    /* ── 间距 ── */
+    --space-1: 4px;   --space-2: 8px;   --space-3: 12px;
+    --space-4: 16px;  --space-6: 24px;  --space-8: 32px;
+    --space-12: 48px; --space-16: 64px;
+
+    /* ── 圆角 ── */
+    --r-sm: 4px;  --r-md: 8px;  --r-lg: 12px;  --r-xl: 16px;  --r-2xl: 24px;  --r-full: 9999px;
+
+    /* ── 过渡时长 ── */
+    --t-fast: 120ms;  --t-base: 200ms;  --t-slow: 320ms;
+
+    /* ── 录音相关 ── */
+    --recording:     0 84% 60%;
+    --recording-pulse: 0 84% 60%;
+  }
+
+  .dark {
+    color-scheme: dark;
+
+    --bg:            224 16% 9%;
+    --bg-card:       224 16% 13%;
+    --bg-subtle:     224 14% 18%;
+    --bg-inset:      224 14% 15%;
+
+    --border:        224 14% 22%;
+    --border-strong: 224 14% 28%;
+
+    --fg:            210 20% 92%;
+    --fg-2:          215 12% 62%;
+    --fg-3:          215 10% 44%;
+
+    --primary:       217 85% 62%;
+    --primary-fg:    0 0% 100%;
+
+    --gold:          38 72% 58%;
+    --gold-fg:       224 16% 9%;
+
+    --ok:            142 65% 48%;   --ok-muted:    142 28% 14%;   --ok-muted-fg:    142 65% 62%;
+    --warn:          38 85% 54%;    --warn-muted:  38 28% 14%;    --warn-muted-fg:  38 85% 68%;
+    --info:          205 85% 58%;   --info-muted:  205 28% 14%;   --info-muted-fg:  205 85% 70%;
+    --danger:        0 68% 52%;     --danger-muted: 0 28% 14%;    --danger-muted-fg: 0 68% 66%;
+    --danger-fg:     0 0% 100%;
+
+    --shadow-color:  0 0% 0%;
+    --shadow-sm:     0 1px 2px hsl(var(--shadow-color) / 0.4);
+    --shadow-md:     0 4px 12px hsl(var(--shadow-color) / 0.5);
+    --shadow-lg:     0 10px 24px hsl(var(--shadow-color) / 0.6);
+
+    --recording:     0 68% 52%;
+    --recording-pulse: 0 68% 52%;
+  }
+
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overflow: hidden;
+  }
+
+  body {
+    font-family: 'DM Sans', system-ui, -apple-system, sans-serif;
+    background: hsl(var(--bg));
+    color: hsl(var(--fg));
+    margin: 0;
+    min-height: 100vh;
+    overflow: hidden;
+    transition: background-color var(--t-base), color var(--t-base);
+  }
+
+  *:focus-visible {
+    outline: 2px solid hsl(var(--primary));
+    outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+/* ── Tailwind v4 Theme Mapping ── */
+
+@theme inline {
+  --color-surface: hsl(var(--bg));
+  --color-surface-card: hsl(var(--bg-card));
+  --color-surface-subtle: hsl(var(--bg-subtle));
+  --color-surface-inset: hsl(var(--bg-inset));
+
+  --color-edge: hsl(var(--border));
+  --color-edge-strong: hsl(var(--border-strong));
+
+  --color-fg: hsl(var(--fg));
+  --color-fg-2: hsl(var(--fg-2));
+  --color-fg-3: hsl(var(--fg-3));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-fg: hsl(var(--primary-fg));
+
+  --color-gold: hsl(var(--gold));
+  --color-gold-fg: hsl(var(--gold-fg));
+
+  --color-ok: hsl(var(--ok));
+  --color-ok-muted: hsl(var(--ok-muted));
+  --color-ok-muted-fg: hsl(var(--ok-muted-fg));
+
+  --color-warn: hsl(var(--warn));
+  --color-warn-muted: hsl(var(--warn-muted));
+  --color-warn-muted-fg: hsl(var(--warn-muted-fg));
+
+  --color-info: hsl(var(--info));
+  --color-info-muted: hsl(var(--info-muted));
+  --color-info-muted-fg: hsl(var(--info-muted-fg));
+
+  --color-danger: hsl(var(--danger));
+  --color-danger-muted: hsl(var(--danger-muted));
+  --color-danger-muted-fg: hsl(var(--danger-muted-fg));
+  --color-danger-fg: hsl(var(--danger-fg));
+
+  --color-recording: hsl(var(--recording));
+
+  --shadow-sm: var(--shadow-sm);
+  --shadow-md: var(--shadow-md);
+  --shadow-lg: var(--shadow-lg);
+
+  --radius-sm: var(--r-sm);
+  --radius-md: var(--r-md);
+  --radius-lg: var(--r-lg);
+  --radius-xl: var(--r-xl);
+  --radius-2xl: var(--r-2xl);
+
+  --font-sans: 'DM Sans', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+}
+
+/* ── Animations ── */
+
+@keyframes pulse-ring {
+  0% {
+    transform: scale(1);
+    opacity: 0.6;
+  }
+  100% {
+    transform: scale(1.8);
+    opacity: 0;
+  }
+}
+
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slide-in-right {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes slide-out-right {
+  from {
+    transform: translateX(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+}
+
+@keyframes mic-breathe {
+  0%, 100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.05);
+  }
+}
+
+@keyframes wave {
+  0%, 100% {
+    height: 8px;
+  }
+  50% {
+    height: 24px;
+  }
+}
+
+@keyframes tooltip-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up 0.35s cubic-bezier(0, 0, 0.2, 1) both;
+}
+
+.animate-slide-in {
+  animation: slide-in-right 0.32s cubic-bezier(0, 0, 0.2, 1) both;
+}
+
+.animate-slide-out {
+  animation: slide-out-right 0.2s cubic-bezier(0.4, 0, 1, 1) both;
+}
+
+.animate-mic-breathe {
+  animation: mic-breathe 2s ease-in-out infinite;
+}
+
+/* ── Scrollbar Styling ──
+ * Overlay scrollbars: zero layout impact, appear only on hover.
+ * Prevents the scrollbar width from causing content shifts when
+ * scrollable areas are created/destroyed (e.g. settings panel).
+ */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+  background: transparent;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: var(--r-full);
+  transition: background 0.2s;
+}
+
+/* Show thumb only when hovering the scrollable container */
+*:hover > ::-webkit-scrollbar-thumb,
+*:hover::-webkit-scrollbar-thumb {
+  background: hsl(var(--fg-3) / 0.25);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--fg-3) / 0.5);
+}
+
+/* Firefox: thin overlay scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+*:hover {
+  scrollbar-color: hsl(var(--fg-3) / 0.25) transparent;
+}
