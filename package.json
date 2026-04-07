@@ -1,16 +1,41 @@
 {
-  "name": "voice-input-app",
+  "name": "speakin",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.0",
+  "description": "SpeakIn 声入 - 全局热键语音输入工具，支持豆包/百炼/千问 ASR 与 AI 优化",
+  "license": "GPL-3.0",
+  "author": "magiccodelab",
+  "homepage": "https://github.com/magiccodelab/speakIn",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/magiccodelab/speakIn.git"
+  },
+  "bugs": {
+    "url": "https://github.com/magiccodelab/speakIn/issues"
+  },
+  "keywords": [
+    "voice-input",
+    "asr",
+    "tauri",
+    "productivity",
+    "speech-to-text",
+    "doubao",
+    "dashscope",
+    "qwen"
+  ],
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:build": "tauri build",
+    "tauri:build:cached": "cross-env RUSTC_WRAPPER=sccache tauri build"
   },
   "dependencies": {
+    "@radix-ui/react-select": "^2.2.6",
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-autostart": "^2.5.1",
     "@tauri-apps/plugin-opener": "^2",
     "clsx": "^2.1.1",
     "lucide-react": "^0.474.0",
@@ -25,6 +50,7 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.0",
+    "cross-env": "^10.1.0",
     "tailwindcss": "^4",
     "typescript": "~5.6.2",
     "vite": "^6.0.3"

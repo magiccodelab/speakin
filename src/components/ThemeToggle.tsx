@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { Sun, Moon } from "lucide-react";
 import { cn } from "../lib/utils";
 import { Tooltip } from "./ui/Tooltip";
+import { applyThemeColor } from "../lib/theme-colors";
 
 export function ThemeToggle() {
   const [dark, setDark] = useState(() => {
@@ -21,6 +22,10 @@ export function ThemeToggle() {
       root.classList.remove("dark");
     }
     localStorage.setItem("theme", dark ? "dark" : "light");
+    // Sync theme color for the new light/dark mode
+    const colorId = localStorage.getItem("theme-color-id") || "blue";
+    const recordingFollows = localStorage.getItem("theme-recording-follows") === "1";
+    applyThemeColor(colorId, dark, recordingFollows);
   }, [dark]);
 
   return (

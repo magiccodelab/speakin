@@ -51,6 +51,12 @@ export function playStartSound() {
   osc.stop(ac.currentTime + 0.3);
 }
 
+/** Error occurred — short low descending warning tone. */
+export function playErrorSound() {
+  playTone(165, 0.2, "sine", 0.15);
+  setTimeout(() => playTone(131, 0.25, "sine", 0.12), 100);
+}
+
 /** Recording stopped — soft descending single note. */
 export function playStopSound() {
   // G5 → fade (softer, shorter than start)

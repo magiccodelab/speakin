@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 /// Wraps rubato's FFT-based resampler for real-time 16-bit mono audio.
 /// Maintains a leftover buffer to handle cpal callbacks that deliver fewer
 /// frames than the resampler's required chunk size.
-struct AudioResampler {
+pub(crate) struct AudioResampler {
     resampler: FftFixedIn<f32>,
     needs_resample: bool,
     leftover: Vec<f32>,
@@ -19,7 +19,7 @@ struct AudioResampler {
 }
 
 impl AudioResampler {
-    fn new(from_rate: u32, to_rate: u32) -> Self {
+    pub(crate) fn new(from_rate: u32, to_rate: u32) -> Result<Self, String> {
         let needs_resample = from_rate != to_rate;
         // chunk_size: number of input frames per process call.
         // 480 frames ≈ 10ms at 48kHz, matches typical WASAPI buffer sizes.
@@ -31,18 +31,18 @@ impl AudioResampler {
             1, // sub_chunks (1 = no sub-chunking)
             1, // mono channel
         )
-        .expect("Failed to create resampler");
+        .map_err(|e| format!("创建重采样器失败 ({}Hz → {}Hz): {}", from_rate, to_rate, e))?;
 
-        Self {
+        Ok(Self {
             resampler,
             needs_resample,
             leftover: Vec::new(),
             chunk_buf: Vec::with_capacity(chunk_size),
             output_buf: Vec::with_capacity(chunk_size),
-        }
+        })
     }
 
-    fn process<'a>(&mut self, input: &'a [i16]) -> Cow<'a, [i16]> {
+    pub(crate) fn process<'a>(&mut self, input: &'a [i16]) -> Cow<'a, [i16]> {
         if !self.needs_resample {
             return Cow::Borrowed(input);
         }
@@ -71,14 +71,16 @@ impl AudioResampler {
         }
         // Remaining samples stay in self.leftover for the next call
 
-        // Clone data for caller, then clear (preserves capacity for next call)
+        // Clone data for caller, then clear (preserves capacity for next call).
+        // One allocation per callback (~640 bytes), but output_buf retains its heap
+        // buffer so push() in the next call never re-allocates.
         let result = self.output_buf.clone();
         self.output_buf.clear();
         Cow::Owned(result)
     }
 }
 
-fn to_mono(data: &[i16], channels: u16) -> Cow<'_, [i16]> {
+pub(crate) fn to_mono(data: &[i16], channels: u16) -> Cow<'_, [i16]> {
     if channels <= 1 {
         return Cow::Borrowed(data);
     }
@@ -147,7 +149,7 @@ fn find_device(device_name: Option<&str>) -> Result<cpal::Device, String> {
 
 /// Simple energy-based voice activity detector.
 /// Suppresses silent audio to avoid ASR server timeouts.
-struct Vad {
+pub(crate) struct Vad {
     /// RMS threshold below which audio is considered silence (0–32767 scale).
     threshold: f64,
     /// Number of consecutive silent chunks observed.
@@ -160,7 +162,7 @@ struct Vad {
 }
 
 impl Vad {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             threshold: 150.0, // ~-46 dBFS, reasonable default for speech vs ambient noise
             silent_chunks: 0,
@@ -170,14 +172,14 @@ impl Vad {
         }
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.silent_chunks = 0;
         self.speech_detected = false;
         self.trailing_remaining = 0;
     }
 
     /// Returns (should_send, rms) — RMS is returned to avoid redundant computation downstream.
-    fn process(&mut self, samples: &[i16]) -> (bool, f64) {
+    pub(crate) fn process(&mut self, samples: &[i16]) -> (bool, f64) {
         let rms = if samples.is_empty() {
             0.0
         } else {
@@ -234,9 +236,11 @@ pub struct AudioFrame {
 }
 
 /// Compute normalized RMS level (0.0..1.0) from raw RMS value.
-fn rms_to_level(rms: f64) -> f32 {
+/// Uses aggressive amplification (16x) + sqrt compression so normal
+/// speech at typical mic distances produces visible waveform activity.
+pub(crate) fn rms_to_level(rms: f64) -> f32 {
     let linear = (rms / 32767.0) as f32;
-    (linear * 4.0).min(1.0).sqrt()
+    (linear * 16.0).min(1.0).sqrt()
 }
 
 // ── MicrophoneManager: always-on audio stream ──
@@ -448,17 +452,18 @@ fn open_stream(
 
     // Build the common callback that owns VAD and Resampler (no Mutex needed).
     // This is a macro-like closure builder to avoid duplicating for I16/F32.
-    let build_callback = |is_f32: bool| {
+    let build_callback = |is_f32: bool| -> Result<_, String> {
         let fwd = is_forwarding.clone();
         let vr = vad_reset.clone();
         let tx = audio_tx.clone();
         let scb = silence_cb.clone();
         // VAD and Resampler owned by closure — lock-free in callback
         let mut vad = Vad::new();
-        let mut resampler = AudioResampler::new(sample_rate, 16000);
+        let mut resampler = AudioResampler::new(sample_rate, 16000)?;
         let mut f32_conv_buf: Vec<i16> = Vec::new();
+        let mut auto_stop_fired = false;
 
-        move |data_i16: Option<&[i16]>, data_f32: Option<&[f32]>| {
+        Ok(move |data_i16: Option<&[i16]>, data_f32: Option<&[f32]>| {
             if !fwd.load(Ordering::Acquire) {
                 return;
             }
@@ -466,6 +471,7 @@ fn open_stream(
             // Check VAD reset signal (set by start_forwarding)
             if vr.swap(false, Ordering::AcqRel) {
                 vad.reset();
+                auto_stop_fired = false;
             }
 
             // Clone sender and release lock immediately — rest of callback is lock-free
@@ -496,8 +502,9 @@ fn open_stream(
             let silence_secs = vad.silence_duration_secs();
             let speech_detected = vad.speech_detected;
 
-            // Auto-stop after prolonged silence
-            if speech_detected && silence_secs >= SILENCE_AUTO_STOP_SECS {
+            // Auto-stop after prolonged silence (fire only once per session)
+            if speech_detected && silence_secs >= SILENCE_AUTO_STOP_SECS && !auto_stop_fired {
+                auto_stop_fired = true;
                 let cb_clone = scb.lock().as_ref().map(Arc::clone);
                 if let Some(cb) = cb_clone {
                     log::info!(
@@ -524,12 +531,12 @@ fn open_stream(
                     has_speech,
                 });
             }
-        }
+        })
     };
 
     let stream = match default_config.sample_format() {
         cpal::SampleFormat::I16 => {
-            let mut callback = build_callback(false);
+            let mut callback = build_callback(false)?;
             device
                 .build_input_stream(
                     &stream_config,
@@ -540,7 +547,7 @@ fn open_stream(
                 .map_err(|e| format!("无法启动音频流: {}", e))?
         }
         cpal::SampleFormat::F32 => {
-            let mut callback = build_callback(true);
+            let mut callback = build_callback(true)?;
             device
                 .build_input_stream(
                     &stream_config,

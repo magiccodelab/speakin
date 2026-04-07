@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Voice Input",
-  "version": "0.1.0",
-  "identifier": "com.afengtech.voice-input-app",
+  "productName": "SpeakIn",
+  "version": "1.0.0",
+  "identifier": "com.speakin.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Voice Input",
+        "title": "SpeakIn",
         "width": 420,
         "height": 660,
         "minWidth": 360,
@@ -24,18 +24,35 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; font-src 'self'"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "magiccodelab",
+    "copyright": "Copyright © 2026 magiccodelab. Licensed under GPL-3.0.",
+    "category": "Productivity",
+    "shortDescription": "全局热键语音输入工具",
+    "longDescription": "SpeakIn 声入是一款静默运行的桌面语音输入工具。按下全局热键即可说话，语音被转写为文字并自动输入到当前焦点窗口（IDE、浏览器、聊天框等）。支持豆包、百炼、千问等主流云端 ASR 服务，并可选 AI 优化润色，助力创作者和开发者高效表达。",
+    "homepage": "https://github.com/magiccodelab/speakIn",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "wix": {
+        "language": ["zh-CN", "en-US"],
+        "upgradeCode": "E7CB2181-FC45-4DDD-BAB0-94EAB2DC2791"
+      },
+      "nsis": {
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": true,
+        "installMode": "currentUser"
+      }
+    }
   }
 }

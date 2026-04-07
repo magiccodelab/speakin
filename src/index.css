@@ -1,5 +1,23 @@
 @import "tailwindcss";
 
+/* ── Local Fonts ── */
+
+@font-face {
+  font-family: "DM Sans";
+  src: url("/fonts/dm-sans-latin-variable.woff2") format("woff2");
+  font-weight: 300 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/fonts/jetbrains-mono-latin-variable.woff2") format("woff2");
+  font-weight: 400 500;
+  font-style: normal;
+  font-display: swap;
+}
+
 /* ── Design Token System ── */
 
 @layer base {
@@ -56,6 +74,22 @@
     /* ── 录音相关 ── */
     --recording:     0 84% 60%;
     --recording-pulse: 0 84% 60%;
+
+    /* ── shadcn 别名层（一次定义，通过 var 链自动跟随 .dark 主题） ── */
+    --background:           var(--bg);
+    --foreground:           var(--fg);
+    --popover:              var(--bg-card);
+    --popover-foreground:   var(--fg);
+    --card:                 var(--bg-card);
+    --card-foreground:      var(--fg);
+    --muted:                var(--bg-subtle);
+    --muted-foreground:     var(--fg-3);
+    --accent:               var(--bg-subtle);
+    --accent-foreground:    var(--fg);
+    --primary-foreground:   var(--primary-fg);
+    --input:                var(--border);
+    --ring:                 var(--primary);
+    --radius:               var(--r-md);
   }
 
   .dark {
@@ -108,11 +142,44 @@
     min-height: 100vh;
     overflow: hidden;
     transition: background-color var(--t-base), color var(--t-base);
+    /* 全局禁用文本选中 —— 桌面应用风格，避免误选 */
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  /* 表单控件与显式 select-text 容器仍允许选中 */
+  input, textarea, [contenteditable="true"], .select-text, .select-text * {
+    user-select: text;
+    -webkit-user-select: text;
+  }
+
+  /* Overlay 窗口：透明背景，防止首次启动时 body/root 背景闪烁
+   * .overlay-window 类由 index.html 头部内联脚本同步设置，
+   * 在 CSS 解析完成前就已存在，因此规则应用时立即生效，无闪烁。 */
+  html.overlay-window,
+  html.overlay-window body,
+  html.overlay-window #root {
+    background: transparent !important;
   }
 
   *:focus-visible {
     outline: 2px solid hsl(var(--primary));
     outline-offset: 2px;
+  }
+
+  /* 全局 cursor-pointer：所有可交互元素统一手型光标 */
+  button:not(:disabled),
+  [role="button"], [role="tab"], [role="switch"],
+  [role="option"], [role="combobox"], [role="radio"],
+  summary {
+    cursor: pointer;
+  }
+
+  /* 表单控件：鼠标点击不显示焦点环，仅键盘导航时显示 */
+  input:not([type="radio"]):not([type="checkbox"]):focus:not(:focus-visible),
+  textarea:focus:not(:focus-visible) {
+    border-color: hsl(var(--border));
+    box-shadow: none;
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -181,6 +248,11 @@
 
 /* ── Animations ── */
 
+@keyframes status-glow {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
 @keyframes pulse-ring {
   0% {
     transform: scale(1);
@@ -234,12 +306,21 @@
   }
 }
 
-@keyframes wave {
+@keyframes wave-medium {
   0%, 100% {
-    height: 8px;
+    height: 5px;
   }
   50% {
-    height: 24px;
+    height: 14px;
+  }
+}
+
+@keyframes wave-gentle {
+  0%, 100% {
+    height: 4px;
+  }
+  50% {
+    height: 10px;
   }
 }
 
@@ -251,6 +332,17 @@
   to {
     opacity: 1;
     transform: scale(1);
+  }
+}
+
+@keyframes select-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }
 
@@ -300,6 +392,15 @@
 
 ::-webkit-scrollbar-thumb:hover {
   background: hsl(var(--fg-3) / 0.5);
+}
+
+/* Utility: completely hide scrollbar (cross-browser) */
+.scrollbar-none {
+  scrollbar-width: none;           /* Firefox */
+  -ms-overflow-style: none;        /* IE/Edge legacy */
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;                   /* Chrome, Safari, WebKit */
 }
 
 /* Firefox: thin overlay scrollbar */

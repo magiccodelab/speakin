@@ -15,7 +15,24 @@
       "Bash(wc:*)",
       "Bash(grep -n \"tokio::\" /i/projects/voice-input-app/src-tauri/src/*.rs)",
       "Bash(cargo fmt:*)",
-      "Bash(cargo build:*)"
+      "Bash(cargo build:*)",
+      "Bash(xargs grep:*)",
+      "Skill(codex:rescue)",
+      "Bash(node:*)",
+      "Bash(find:*)",
+      "mcp__dev-doc-mcp__start_task",
+      "Bash(cargo test:*)",
+      "mcp__dev-doc-mcp__get_doc_section",
+      "Bash(xargs cat:*)",
+      "Bash(grep:*)",
+      "Bash(pnpm tauri:*)",
+      "Bash(ls:*)",
+      "Read(//h/下载/speakin-icons-airy \\(1\\)/icons/**)",
+      "Bash(uv run:*)",
+      "Bash(pnpm tsc:*)",
+      "Bash(python3 -c ':*)",
+      "Bash(powershell -Command ':*)",
+      "Bash(pnpm exec:*)"
     ]
   }
 }

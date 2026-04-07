@@ -10,7 +10,7 @@ export function RadioIndicator({ checked }: RadioIndicatorProps) {
       className={cn(
         "w-4 h-4 rounded-full border-2 flex items-center justify-center shrink-0",
         "transition-colors duration-[var(--t-fast)]",
-        checked ? "border-primary" : "border-edge-strong"
+        checked ? "border-primary" : "border-edge-strong group-hover:border-primary/50"
       )}
     >
       <div

@@ -1,0 +1,22 @@
+<!--
+  Tray-specific icon. Designed at viewBox 0 0 32 32 so strokes/coords land on
+  exact pixel boundaries when rendered at 32x32 (Windows tray native size).
+  No filters, no thin decorations, no near-white fills — everything that goes
+  fuzzy below 24px in the main icon.svg has been stripped.
+-->
+<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" shape-rendering="geometricPrecision">
+  <!-- Background: solid brand blue rounded square (high contrast on both light & dark trays) -->
+  <rect width="32" height="32" rx="7" fill="#2563EB"/>
+
+  <!-- Mic body: white rounded capsule -->
+  <rect x="13" y="6" width="6" height="13" rx="3" fill="#ffffff"/>
+
+  <!-- Mic stand arc (U shape under the body) -->
+  <path d="M9 15a7 7 0 0014 0" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- Vertical stem from arc bottom to base -->
+  <line x1="16" y1="22" x2="16" y2="26" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- Base bar -->
+  <line x1="13" y1="26" x2="19" y2="26" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>
+</svg>

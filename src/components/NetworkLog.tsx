@@ -50,7 +50,7 @@ export function NetworkLog({ logs, onClear }: NetworkLogProps) {
         {expanded && (
           <button
             onClick={(e) => { e.stopPropagation(); onClear(); }}
-            className="p-1 text-fg-3 hover:text-fg-2 active:scale-90 transition-all"
+            className="p-1 rounded text-fg-3 hover:text-fg-2 hover:bg-surface-subtle active:scale-95 transition-all"
             title="清除日志"
           >
             <Trash2 size={12} />

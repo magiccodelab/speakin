@@ -1,0 +1,13 @@
+[build]
+# 默认并行任务数（CPU/内存够就拉满）
+jobs = 16
+
+[target.x86_64-pc-windows-msvc]
+# 用 rust-lld 替代 MSVC link.exe，链接阶段更快
+# 随 rustup 自带，无需额外安装；如遇兼容问题，注释掉这两行即可回退
+linker = "rust-lld.exe"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# 注意：这里故意不配置 rustc-wrapper = "sccache"
+# 原因：sccache 会强制关闭 cargo 增量编译，dev 模式反而变慢
+# release 构建按需临时启用：RUSTC_WRAPPER=sccache pnpm tauri build

@@ -4,16 +4,32 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
-    <title>Voice Input</title>
-    <!-- Prevent dark-mode flash: apply .dark BEFORE any rendering occurs -->
+    <title>SpeakIn</title>
+    <!-- Prevent dark-mode & theme-color flash: apply BEFORE any rendering -->
     <script>
       (function() {
+        // Overlay window: mark html with class so CSS can force transparent bg
+        // BEFORE any paint. Without this, body{background:hsl(--bg)} from
+        // index.css briefly paints an opaque rect on first launch.
+        if (window.location.hash === '#overlay') {
+          document.documentElement.classList.add('overlay-window');
+        }
         var t = localStorage.getItem('theme');
         if (t === 'dark' || (!t && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
           document.documentElement.classList.add('dark');
+        }
+        // Theme color: read cached HSL values (source of truth is theme-colors.ts)
+        var id = localStorage.getItem('theme-color-id');
+        if (id && id !== 'blue') {
+          var isDark = document.documentElement.classList.contains('dark');
+          var hsl = localStorage.getItem(isDark ? 'theme-color-dark' : 'theme-color-light');
+          if (hsl) {
+            document.documentElement.style.setProperty('--primary', hsl);
+            if (localStorage.getItem('theme-recording-follows') === '1') {
+              document.documentElement.style.setProperty('--recording', hsl);
+              document.documentElement.style.setProperty('--recording-pulse', hsl);
+            }
+          }
         }
       })();
     </script>
@@ -21,5 +37,15 @@
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
+    <script>
+      // Set root bg to match theme — prevents white flash on startup.
+      // Only for main window; overlay window (#overlay hash) clears this in main.tsx.
+      if (window.location.hash !== '#overlay') {
+        var bg = document.documentElement.classList.contains('dark')
+          ? 'hsl(224 16% 9%)'
+          : 'hsl(220 20% 97%)';
+        document.getElementById('root').style.background = bg;
+      }
+    </script>
   </body>
 </html>

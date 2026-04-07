@@ -1,18 +1,24 @@
 [package]
-name = "voice-input-app"
-version = "0.1.0"
-description = "Voice Input App - Doubao ASR powered voice-to-text"
-authors = ["afengtech"]
+name = "speakin"
+version = "1.0.0"
+description = "SpeakIn 声入 - 全局热键语音输入工具，支持豆包/百炼/千问 ASR 与 AI 优化"
+authors = ["magiccodelab", "afengblog"]
+license = "GPL-3.0"
 edition = "2021"
+repository = "https://github.com/magiccodelab/speakIn"
+homepage = "https://github.com/magiccodelab/speakIn"
+readme = "../README.md"
+keywords = ["voice-input", "asr", "tauri", "productivity", "speech-to-text"]
+categories = ["multimedia::audio", "accessibility"]
 
 [lib]
-name = "voice_input_app_lib"
+name = "speakin_lib"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -28,11 +34,25 @@ env_logger = "0.11"
 arboard = "3"
 enigo = "0.5"
 rubato = "0.16"
-dotenvy = "0.15"
-rdev = { version = "0.5", features = ["unstable_grab"] }
+tauri-plugin-store = "2"
+keyring = { version = "3", features = ["windows-native", "apple-native"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+] }
+windows = { version = "0.58", features = [
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+] }
+tauri-plugin-autostart = "2"
+base64 = "0.22"
+reqwest = { version = "0.12", features = ["json", "stream", "native-tls"] }
 
 [profile.release]
-lto = "thin"
+lto = true
 codegen-units = 1
 strip = "symbols"
 opt-level = 3
