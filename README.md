@@ -13,7 +13,7 @@
 
 ---
 
-> **📌 平台说明：** 当前版本主要适配 **Windows**，已提供开箱即用的安装包。macOS / Linux 用户需从源码自行构建，部分平台相关功能（全局热键、WASAPI Loopback 等）可能需要修改代码适配。项目采用模块化架构，平台相关代码集中在少数几个文件，维护和移植成本较低——推荐使用 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 或 [Codex](https://openai.com/index/codex/) 等 AI 编程工具辅助构建。
+> **📌 平台说明：** 当前版本主要适配 **Windows**，已提供开箱即用的安装包。macOS / Linux 用户需从源码自行构建，部分平台相关功能（全局热键、WASAPI Loopback 等）可能需要修改代码适配。项目采用模块化架构，平台相关代码集中在少数几个文件，维护和移植成本较低——推荐使用 [Claude Code](https://code.claude.com/docs) 或 [Codex](https://openai.com/index/codex/) 等 AI 编程工具辅助构建。
 
 ## 简介
 
