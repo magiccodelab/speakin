@@ -12,6 +12,20 @@ export const THEME_PRESETS: ThemeColorPreset[] = [
   { id: "orange", name: "橙色", light: "25 95% 53%",  dark: "25 90% 60%" },
   { id: "rose",   name: "玫红", light: "340 82% 52%", dark: "340 80% 62%" },
   { id: "cyan",   name: "青色", light: "186 72% 42%", dark: "186 70% 52%" },
+  { id: "indigo", name: "靛蓝", light: "239 84% 67%", dark: "234 89% 74%" },
+  { id: "teal",   name: "青碧", light: "173 80% 40%", dark: "172 66% 50%" },
+  { id: "amber",  name: "琥珀", light: "38 92% 50%",  dark: "43 96% 56%" },
+  { id: "fuchsia", name: "品红", light: "292 84% 61%", dark: "292 91% 73%" },
+  { id: "lime",   name: "青柠", light: "84 81% 44%",  dark: "83 78% 55%" },
+  { id: "graphite", name: "石墨", light: "215 16% 47%", dark: "215 20% 65%" },
+  { id: "sky",    name: "天蓝", light: "199 89% 48%", dark: "198 93% 60%" },
+  { id: "lavender", name: "薰衣草", light: "255 92% 76%", dark: "252 95% 85%" },
+  { id: "emerald", name: "森林", light: "160 84% 39%", dark: "158 64% 52%" },
+  { id: "terracotta", name: "赤陶", light: "17 88% 40%", dark: "24 90% 60%" },
+  { id: "midnight", name: "午夜蓝", light: "226 71% 40%", dark: "213 94% 68%" },
+  { id: "peach",  name: "蜜桃", light: "351 95% 71%", dark: "351 95% 74%" },
+  { id: "matcha", name: "抹茶", light: "140 12% 54%", dark: "137 20% 71%" },
+  { id: "mint",   name: "薄荷", light: "173 58% 50%", dark: "170 77% 64%" },
 ];
 
 const DEFAULT_ID = "blue";
@@ -29,7 +43,7 @@ export function applyThemeColor(colorId: string, isDark: boolean, recordingFollo
     root.style.setProperty("--primary", hsl);
   }
 
-  if (recordingFollows && resolvedId !== DEFAULT_ID) {
+  if (recordingFollows) {
     root.style.setProperty("--recording", hsl);
     root.style.setProperty("--recording-pulse", hsl);
   } else {

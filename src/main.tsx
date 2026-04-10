@@ -40,5 +40,18 @@ if (window.location.hash === "#overlay") {
 } else {
   import("./App").then(({ default: App }) => {
     ReactDOM.createRoot(root).render(<App />);
+    // Main window starts hidden (tauri.conf.json visible:false) to avoid the
+    // native white flash before WebView2 paints. Show it once the first frame
+    // with correct theme has been rendered.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(async () => {
+        try {
+          const { getCurrentWindow } = await import("@tauri-apps/api/window");
+          await getCurrentWindow().show();
+        } catch (e) {
+          console.warn("Failed to show main window:", e);
+        }
+      });
+    });
   });
 }

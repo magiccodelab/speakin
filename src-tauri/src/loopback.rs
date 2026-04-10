@@ -23,14 +23,16 @@ pub struct LoopbackCapture {
 impl LoopbackCapture {
     /// Start capturing audio from the default render (output) device.
     /// Audio is resampled to 16kHz mono and sent as `AudioFrame`.
-    pub fn start(audio_tx: mpsc::UnboundedSender<AudioFrame>) -> Result<Self, String> {
+    /// `vad_sensitivity` controls the VAD threshold (1-10, default 7).
+    pub fn start(audio_tx: mpsc::UnboundedSender<AudioFrame>, vad_sensitivity: u8) -> Result<Self, String> {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let flag = stop_flag.clone();
+        let threshold = crate::audio::sensitivity_to_rms(vad_sensitivity);
 
         let thread = std::thread::Builder::new()
             .name("loopback-capture".into())
             .spawn(move || {
-                if let Err(e) = capture_loop(flag, audio_tx) {
+                if let Err(e) = capture_loop(flag, audio_tx, threshold) {
                     log::error!("Loopback capture error: {}", e);
                 }
             })
@@ -68,6 +70,7 @@ const WAVE_FORMAT_IEEE_FLOAT_TAG: u16 = 0x0003;
 fn capture_loop(
     stop_flag: Arc<AtomicBool>,
     audio_tx: mpsc::UnboundedSender<AudioFrame>,
+    vad_threshold: f64,
 ) -> Result<(), String> {
     unsafe {
         // CoInitializeEx: Ok(()) = success, Err with S_FALSE = already initialized (fine)
@@ -140,7 +143,7 @@ fn capture_loop(
 
         // Processing state
         let mut resampler = AudioResampler::new(sample_rate, 16000)?;
-        let mut vad = Vad::new();
+        let mut vad = Vad::with_threshold(vad_threshold);
 
         log::info!("[loopback] capture started");
 
@@ -217,7 +220,8 @@ fn capture_loop(
                     let frame = AudioFrame {
                         pcm,
                         level,
-                        has_speech: rms >= 150.0,
+                        rms: rms as f32,
+                        has_speech: rms >= vad_threshold,
                     };
 
                     if audio_tx.send(frame).is_err() {

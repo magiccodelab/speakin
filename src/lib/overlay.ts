@@ -9,6 +9,7 @@
  */
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { currentMonitor } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
 
 const OVERLAY_LABEL = "recording-overlay";
 export const OVERLAY_WIDTH = 480;
@@ -85,6 +86,15 @@ export async function showOverlay() {
       shadow: false,
     });
     overlayWindow = win;
+
+    // Prevent the overlay from stealing keyboard focus when clicked.
+    // WS_EX_NOACTIVATE ensures hotkeys won't trigger original key behavior
+    // (e.g. CapsLock toggle) when the user clicks on the overlay.
+    win.once("tauri://created", () => {
+      invoke("set_window_no_activate", { label: OVERLAY_LABEL }).catch((e) => {
+        console.warn("Failed to set WS_EX_NOACTIVATE on overlay:", e);
+      });
+    });
 
     // Only clear if this window is still the active one (prevents a stale
     // error callback from an old window nulling a newer window's reference)

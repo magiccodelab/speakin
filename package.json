@@ -1,8 +1,8 @@
 {
   "name": "speakin",
   "private": true,
-  "version": "1.0.0",
-  "description": "SpeakIn 声入 - 全局热键语音输入工具，支持豆包/百炼/千问 ASR 与 AI 优化",
+  "version": "1.0.8",
+  "description": "SpeakIn声入 - 全局热键语音输入工具，支持豆包/百炼/千问 ASR 与 AI 优化",
   "license": "GPL-3.0",
   "author": "magiccodelab",
   "homepage": "https://github.com/magiccodelab/speakIn",
@@ -30,10 +30,13 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:build": "tauri build",
-    "tauri:build:cached": "cross-env RUSTC_WRAPPER=sccache tauri build"
+    "tauri:build:cached": "cross-env RUSTC_WRAPPER=sccache tauri build",
+    "tauri:build:portable": "tauri build --no-bundle && node scripts/make-portable-zip.mjs",
+    "tauri:build:portable:cached": "cross-env RUSTC_WRAPPER=sccache tauri build --no-bundle && node scripts/make-portable-zip.mjs"
   },
   "dependencies": {
     "@radix-ui/react-select": "^2.2.6",
+    "@radix-ui/react-slider": "^1.3.6",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-autostart": "^2.5.1",
     "@tauri-apps/plugin-opener": "^2",

@@ -1,6 +1,6 @@
 <div align="center">
 
-# SpeakIn 声入
+# SpeakIn声入
 
 **静默运行的桌面语音输入工具 · 按下热键即说即输**
 

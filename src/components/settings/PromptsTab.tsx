@@ -79,7 +79,7 @@ export function PromptsTab({ prompts, activePromptId, onActivePromptIdChange, on
       name: "",
       category: defaultCategory,
       system_prompt: "",
-      user_prompt_template: "{{text}}",
+      user_prompt_template: "<input>\n{{text}}\n</input>",
       is_builtin: false,
     });
     setIsNew(true);
@@ -208,7 +208,7 @@ export function PromptsTab({ prompts, activePromptId, onActivePromptIdChange, on
           <textarea value={editing.user_prompt_template}
             onChange={(e) => setEditing({ ...editing, user_prompt_template: e.target.value })}
             placeholder="使用 {{text}} 引用转写文本" className={textareaClass} rows={3} />
-          <p className="text-xs text-fg-3">使用 <code className="px-1 py-0.5 rounded bg-surface-inset font-mono">{"{{text}}"}</code> 占位符引用转写文本</p>
+          <p className="text-xs text-fg-3">使用 <code className="px-1 py-0.5 rounded bg-surface-inset font-mono">{"{{text}}"}</code> 引用转写文本；建议用 <code className="px-1 py-0.5 rounded bg-surface-inset font-mono">{"<input>...</input>"}</code> 包裹以明确边界、避免提示词注入</p>
         </div>
 
         {error && (

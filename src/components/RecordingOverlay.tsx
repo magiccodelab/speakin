@@ -42,9 +42,10 @@ const SUBTITLE_BUBBLE_MAX =
 interface TranscriptPayload {
   text: string;
   is_final: boolean;
+  generation: number;
 }
 
-type OverlayPhase = "recording" | "processing" | "optimizing" | "idle";
+type OverlayPhase = "recording" | "processing" | "optimizing" | "error" | "idle";
 
 // Sync theme & color BEFORE first render
 (() => {
@@ -55,10 +56,12 @@ type OverlayPhase = "recording" | "processing" | "optimizing" | "idle";
 
   // Theme color (read localStorage cache)
   const id = localStorage.getItem("theme-color-id");
-  if (id && id !== "blue") {
+  if (id) {
     const hsl = localStorage.getItem(isDark ? "theme-color-dark" : "theme-color-light");
     if (hsl) {
-      document.documentElement.style.setProperty("--primary", hsl);
+      if (id !== "blue") {
+        document.documentElement.style.setProperty("--primary", hsl);
+      }
       if (localStorage.getItem("theme-recording-follows") === "1") {
         document.documentElement.style.setProperty("--recording", hsl);
         document.documentElement.style.setProperty("--recording-pulse", hsl);
@@ -67,25 +70,35 @@ type OverlayPhase = "recording" | "processing" | "optimizing" | "idle";
   }
 })();
 
+function readSubtitlePref(): boolean {
+  return localStorage.getItem("overlay-subtitle") !== "0";
+}
+
 export function RecordingOverlay() {
   const [heights, setHeights] = useState<number[]>(() => Array(BAR_COUNT).fill(MIN_H));
   const [committed, setCommitted] = useState("");
   const [interim, setInterim] = useState("");
   const [phase, setPhase] = useState<OverlayPhase>("recording");
-  // [Batch 2] Slow-hint flag — driven by the `overlay-slow` event from
-  // App.tsx. Flips true ~3s into post-recording if FINAL hasn't arrived,
-  // flips back to false on FINAL / new session / error / doAutoInput start.
   const [slow, setSlow] = useState(false);
+  const [subtitleEnabled, setSubtitleEnabled] = useState(readSubtitlePref);
+  // Latest known session id (from overlay-phase events — the app-window
+  // increments its sessionId on each new recording and sends it in
+  // overlay-phase + overlay-slow). Used to drop stale events.
   const sessionRef = useRef(0);
+  // Latest known backend generation (from transcription-update events).
+  // The overlay window runs in its own process and doesn't share state
+  // with App.tsx, so it needs an independent self-healing filter here.
+  const backendGenRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const levelRef = useRef(0);
   const rafRef = useRef(0);
   const smoothRef = useRef(0);
 
-  // Derive display booleans from phase (variable names unchanged — JSX untouched)
+  // Derive display booleans from phase
   const isRecording = phase === "recording";
   const isProcessing = phase === "processing" || phase === "optimizing";
   const isOptimizing = phase === "optimizing";
+  const isError = phase === "error";
 
   const displayText = committed + (interim ? (committed ? " " : "") + interim : "");
 
@@ -109,6 +122,13 @@ export function RecordingOverlay() {
     const fns: (() => void)[] = [];
 
     listen<TranscriptPayload>("transcription-update", (e) => {
+      // [Codex Q3a fix] Drop late events from previous sessions — without
+      // this, a slow FINAL from session N can append to session N+1's
+      // subtitle bubble because the overlay window has its own listener
+      // independent of App.tsx's filter.
+      const gen = e.payload.generation;
+      if (gen < backendGenRef.current) return;
+      if (gen > backendGenRef.current) backendGenRef.current = gen;
       const { text, is_final } = e.payload;
       if (is_final) {
         setCommitted((prev) => (prev ? prev + " " : "") + text);
@@ -126,10 +146,15 @@ export function RecordingOverlay() {
       sessionRef.current = sessionId;
       setPhase(newPhase);
       if (newPhase === "recording") {
-        // New recording started — reset text and slow hint
+        // New recording started — reset text and slow hint.
+        // Note: we do NOT reset backendGenRef here because
+        // transcription-update and overlay-phase are independent event
+        // streams. The next transcription-update with a larger
+        // generation will self-heal the filter.
         setCommitted("");
         setInterim("");
         setSlow(false);
+        setSubtitleEnabled(readSubtitlePref());
       } else if (newPhase === "idle") {
         // Defensive: make sure slow doesn't linger into the next phase
         setSlow(false);
@@ -209,7 +234,11 @@ export function RecordingOverlay() {
     return () => { running = false; cancelAnimationFrame(rafRef.current); };
   }, [isRecording]);
 
-  const barColor = isRecording ? "hsl(var(--recording))" : "hsl(var(--primary))";
+  const barColor = isError
+    ? "hsl(var(--danger))"
+    : isRecording
+      ? "hsl(var(--recording))"
+      : "hsl(var(--primary))";
 
   return (
     <div className="w-full h-screen flex flex-col items-center select-none">
@@ -217,7 +246,7 @@ export function RecordingOverlay() {
       <div
         className="w-full flex-1 min-h-0 px-3 pt-2 pb-1.5 flex items-end justify-center"
       >
-        {displayText && (
+        {subtitleEnabled && displayText && (
           <div
             className="max-w-full rounded-xl bg-[hsl(var(--bg-card)/0.9)] backdrop-blur-lg shadow-[0_2px_12px_hsl(var(--shadow-color)/0.08)] border border-[hsl(var(--border)/0.3)] overflow-hidden mb-1.5"
             style={{
@@ -255,8 +284,8 @@ export function RecordingOverlay() {
         onContextMenu={handleContextMenu}
         className="shrink-0 mt-1 mb-1 flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-[hsl(var(--bg-card)/0.85)] backdrop-blur-md shadow-[0_2px_12px_hsl(var(--shadow-color)/0.08)] border border-[hsl(var(--border)/0.3)] cursor-grab active:cursor-grabbing transition-transform duration-150 hover:scale-[1.04] hover:shadow-[0_2px_16px_hsl(var(--shadow-color)/0.15)] hover:border-[hsl(var(--border)/0.5)]"
       >
-        <span className="w-1.5 h-1.5 rounded-full shrink-0 animate-pulse" style={{ backgroundColor: barColor }} />
-        <div className="flex items-center gap-[3px]" style={{ height: MAX_H }}>
+        <span className="w-1.5 h-1.5 rounded-full shrink-0 animate-pulse pointer-events-none" style={{ backgroundColor: barColor }} />
+        <div className="flex items-center gap-[3px] pointer-events-none" style={{ height: MAX_H }}>
           {heights.map((h, i) => (
             <span
               key={i}
@@ -269,14 +298,24 @@ export function RecordingOverlay() {
                   ? isOptimizing
                     ? `wave-gentle 2.5s ease-in-out ${i * 0.18}s infinite`
                     : `wave-medium 1.8s ease-in-out ${i * 0.15}s infinite`
-                  : "none",
+                  : isError
+                    ? `wave-gentle 1.4s ease-in-out ${i * 0.1}s infinite`
+                    : "none",
               }}
             />
           ))}
         </div>
         {isProcessing && (
-          <span className="text-[11px] whitespace-nowrap" style={{ color: "hsl(var(--primary))" }}>
+          <span className="text-[11px] whitespace-nowrap pointer-events-none" style={{ color: "hsl(var(--primary))" }}>
             {isOptimizing ? "AI 优化中" : slow ? "正在努力识别中…" : "识别中"}
+          </span>
+        )}
+        {isError && (
+          <span
+            className="text-[11px] whitespace-nowrap pointer-events-none"
+            style={{ color: "hsl(var(--danger))" }}
+          >
+            识别失败
           </span>
         )}
       </div>

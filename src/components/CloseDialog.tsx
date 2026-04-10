@@ -88,7 +88,7 @@ export function CloseDialog({ open, onChoice, onCancel }: CloseDialogProps) {
                   )}
                 >
                   <div className="text-fg">退出应用</div>
-                  <div className="text-xs text-fg-3 mt-0.5">完全关闭 SpeakIn</div>
+                  <div className="text-xs text-fg-3 mt-0.5">完全关闭 SpeakIn声入</div>
                 </button>
               </div>
 

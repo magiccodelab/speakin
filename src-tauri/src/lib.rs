@@ -17,7 +17,10 @@ use hotkey::{HotkeyEvent, InputMode};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{Emitter, Manager};
+use windows_sys::Win32::Foundation::SYSTEMTIME;
+use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
 /// Doubao (豆包) provider settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +159,8 @@ pub struct AppSettings {
     pub recording_follows_theme: bool,
     #[serde(default = "default_true")]
     pub show_overlay: bool,
+    #[serde(default = "default_true")]
+    pub show_overlay_subtitle: bool,
     #[serde(default = "default_close_behavior")]
     pub close_behavior: String,
     #[serde(default)]
@@ -168,10 +173,22 @@ pub struct AppSettings {
     pub system_no_auto_stop: bool,
     #[serde(default = "default_true")]
     pub esc_abort_enabled: bool,
+    #[serde(default = "default_silence_auto_stop_secs")]
+    pub silence_auto_stop_secs: u8,
+    #[serde(default = "default_vad_sensitivity")]
+    pub vad_sensitivity: u8,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_silence_auto_stop_secs() -> u8 {
+    6
+}
+
+fn default_vad_sensitivity() -> u8 {
+    7
 }
 
 fn default_audio_source() -> String {
@@ -237,12 +254,15 @@ impl Default for AppSettings {
             // user's chosen theme color (no jarring red flash).
             recording_follows_theme: true,
             show_overlay: true,
+            show_overlay_subtitle: true,
             close_behavior: "ask".to_string(),
             onboarding_completed: false,
             copy_to_clipboard: false,
             paste_restore_clipboard: true,
             system_no_auto_stop: false,
             esc_abort_enabled: true,
+            silence_auto_stop_secs: default_silence_auto_stop_secs(),
+            vad_sensitivity: default_vad_sensitivity(),
         }
     }
 }
@@ -270,6 +290,13 @@ fn default_transcript_status() -> String {
 pub struct RecordingStatusPayload {
     pub recording: bool,
     pub generation: u64,
+    /// For `recording: false` emits, indicates whether VAD observed any
+    /// speech during the session. `false` → fast-path close on the
+    /// frontend (no post-recording flow, no 3s/6s wait). For
+    /// `recording: true` emits, always `false` (the field is unused at
+    /// start time but kept for schema simplicity).
+    #[serde(default)]
+    pub had_speech: bool,
 }
 
 /// Payload for the `session-force-abort` event. Carries the backend
@@ -316,15 +343,28 @@ fn count_chinese_chars(text: &str) -> u64 {
 }
 
 /// Shared application state.
+///
+/// **Session lifecycle note (2026-04 refactor)**: there is no more
+/// `is_processing` gate. The backend's session ownership ends the moment
+/// the ASR task exits — at that point `finalize_session` has already
+/// persisted any accumulated text and emitted `session-ended`, so the
+/// next recording can start immediately. Any post-session work (AI
+/// optimize, text output) runs on the frontend and is session-scoped
+/// via generation checks — it cannot block a new session from starting.
 struct AppStateInner {
     is_recording: bool,
-    /// True from the moment `do_stop_recording_impl` signals stop until the
-    /// frontend's `doAutoInput` pipeline finishes (signaled via `mark_session_idle`)
-    /// or the 60s safety timeout fires. During this window, new recording
-    /// sessions are rejected — protects against the "user hits hotkey again
-    /// while previous session's ASR FINAL / AI optimize is still pending" race.
-    is_processing: bool,
     recording_generation: u64,
+    /// VAD-observed fact for the current session: `true` once
+    /// `wait_for_speech` confirms speech start. Cloned into the ASR task
+    /// so the provider can flip it lock-free. The provider copies this
+    /// into its `SessionOutcome` at exit so `finalize_session` knows
+    /// whether to emit `status: "no_speech"`.
+    had_speech: Arc<AtomicBool>,
+    /// Set to `true` by `abort_current_session_impl` (ESC). The ASR task
+    /// reads this at exit to decide whether its `SessionOutcome.aborted`
+    /// should be set, which in turn makes `finalize_session` emit
+    /// `status: "aborted"` and persist the record with status `aborted`.
+    aborted: Arc<AtomicBool>,
     settings: Arc<AppSettings>,
     mic_manager: Option<MicrophoneManager>,
     loopback: Option<loopback::LoopbackCapture>,
@@ -399,6 +439,16 @@ fn sanitize_loaded_settings(mut settings: AppSettings) -> (AppSettings, Option<S
         should_persist = true;
     }
 
+    // Sanitize VAD settings
+    if settings.silence_auto_stop_secs < 3 || settings.silence_auto_stop_secs > 60 {
+        settings.silence_auto_stop_secs = default_silence_auto_stop_secs();
+        should_persist = true;
+    }
+    if settings.vad_sensitivity < 1 || settings.vad_sensitivity > 10 {
+        settings.vad_sensitivity = default_vad_sensitivity();
+        should_persist = true;
+    }
+
     (settings, warning, should_persist)
 }
 
@@ -426,22 +476,61 @@ fn validate_provider_credentials(settings: &AppSettings) -> Result<(), String> {
 }
 
 /// Emit a network log event to the frontend.
-fn emit_log(app_handle: &tauri::AppHandle, level: &str, msg: &str) {
+pub(crate) fn emit_log(app_handle: &tauri::AppHandle, level: &str, msg: &str) {
     let ts = chrono_now();
     let log_entry = serde_json::json!({ "ts": ts, "level": level, "msg": msg });
     let _ = app_handle.emit("network-log", log_entry.to_string());
 }
 
+pub(crate) fn emit_app_log(app_handle: &tauri::AppHandle, level: &str, msg: &str) {
+    emit_log(app_handle, level, &format!("[APP] {}", msg));
+}
+
 fn chrono_now() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs() % 86400;
-    let h = secs / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
-    let ms = now.subsec_millis();
-    format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
+    unsafe {
+        let mut now = std::mem::zeroed::<SYSTEMTIME>();
+        GetLocalTime(&mut now);
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+            now.wYear,
+            now.wMonth,
+            now.wDay,
+            now.wHour,
+            now.wMinute,
+            now.wSecond,
+            now.wMilliseconds
+        )
+    }
+}
+
+fn provider_label(provider: &str) -> &'static str {
+    match provider {
+        "dashscope" => "百炼",
+        "qwen" => "千问",
+        _ => "豆包",
+    }
+}
+
+fn audio_source_label(audio_source: &str) -> &'static str {
+    match audio_source {
+        "system" => "系统声音",
+        _ => "麦克风",
+    }
+}
+
+fn input_mode_label(input_mode: &str) -> &'static str {
+    match input_mode {
+        "hold" => "按住说话",
+        _ => "按键切换",
+    }
+}
+
+fn output_mode_label(mode: input::OutputMode) -> &'static str {
+    match mode {
+        input::OutputMode::Paste => "粘贴",
+        input::OutputMode::Type => "模拟输入",
+        input::OutputMode::None => "仅保留应用内",
+    }
 }
 
 // ── Tauri Commands ──
@@ -567,6 +656,26 @@ fn list_audio_devices() -> Vec<String> {
     audio::list_input_devices()
 }
 
+/// Measure microphone input level over a fixed window (default 3000ms, max 10000ms).
+/// Returns peak/avg dBFS so the user can verify their mic gain in advanced settings.
+/// Refuses to run while a recording session is active to avoid overlapping streams.
+#[tauri::command]
+async fn measure_microphone_level(
+    state: tauri::State<'_, AppState>,
+    device_name: Option<String>,
+    duration_ms: Option<u64>,
+) -> Result<audio::LevelStats, String> {
+    if state.inner.lock().is_recording {
+        return Err("录音进行中，无法测试麦克风电平".to_string());
+    }
+    let dur = duration_ms.unwrap_or(3000).min(10_000);
+    tokio::task::spawn_blocking(move || {
+        audio::measure_input_level(device_name.as_deref(), dur)
+    })
+    .await
+    .map_err(|e| format!("测量任务执行失败: {}", e))?
+}
+
 
 /// Get text replacement pairs.
 #[tauri::command]
@@ -669,118 +778,50 @@ fn send_text_input(
         return;
     }
     let (processed, mode, copy, restore) = process_text(&app_handle, &state.inner, text, false);
+    if !processed.trim().is_empty() {
+        emit_app_log(
+            &app_handle,
+            "info",
+            &format!(
+                "已输出文字 [{}，{} 字{}]",
+                output_mode_label(mode),
+                processed.chars().count(),
+                if copy {
+                    if restore {
+                        "，已同步剪贴板并恢复"
+                    } else {
+                        "，已同步剪贴板"
+                    }
+                } else {
+                    ""
+                }
+            ),
+        );
+    }
     do_output(&processed, mode, copy, restore);
 }
 
-/// Persist a transcript record to the history store WITHOUT any text output.
-/// Returns the record id so the frontend can later call `update_transcript_optimized`
-/// to fill in the AI-optimized version once it arrives.
-///
-/// This is the "先保文本" primitive — called at the start of `doAutoInput` and
-/// also from the rescue path in the new-session handler. Separated from
-/// `send_text_input` so the rescue path can persist pending text without
-/// ghost-typing it into whatever window currently has focus.
-#[tauri::command]
-fn save_transcript_record(
-    app_handle: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    original: String,
-    optimized: Option<String>,
-    duration_ms: u64,
-    status: String,
-) -> Result<String, String> {
-    if original.len() > MAX_TEXT_LEN
-        || optimized.as_ref().map_or(false, |s| s.len() > MAX_TEXT_LEN)
-    {
-        return Err("text_too_long".to_string());
-    }
-    let has_ai = optimized.is_some();
-    let input_text = optimized.clone().unwrap_or_else(|| original.clone());
-    let (final_text, _mode, _copy, _restore) =
-        process_text(&app_handle, &state.inner, input_text, has_ai);
-
-    if final_text.trim().is_empty() {
-        return Err("empty_text".to_string());
-    }
-
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    // [修订 R1] id 同时携带时间戳和 generation，避免同毫秒冲突（rescue + doAutoInput）
-    let generation = state.inner.lock().recording_generation;
-    let id = format!("{}-{}", now_ms, generation);
-
-    let record = TranscriptRecord {
-        id: id.clone(),
-        timestamp: now_ms,
-        original,
-        final_text,
-        optimized,
-        duration_ms,
-        status,
-    };
-
-    storage::append_transcript_record(&app_handle, record)
-        .map_err(|e| format!("persist failed: {}", e))?;
-
-    Ok(id)
-}
-
 /// Update the `optimized` field of a previously saved record, and promote
-/// its status from "partial" → "done" if applicable. Called when AI optimize
-/// completes after the raw record was already persisted.
+/// its status from "partial" → "done" if applicable. Called by the frontend
+/// after AI optimize completes to append the optimized version onto the
+/// record that `finalize_session` already persisted.
 #[tauri::command]
 fn update_transcript_optimized(
     app_handle: tauri::AppHandle,
     id: String,
     optimized: String,
 ) -> Result<(), String> {
-    storage::update_transcript_optimized_by_id(&app_handle, &id, optimized)
-}
-
-/// Update an existing record's `status` field. Used by the frontend ESC
-/// abort path when the user cancels during AI optimize: the record was
-/// already saved as "partial" by `doAutoInput` Step 1, and we want to
-/// promote it to "aborted" to reflect the user's actual intent.
-#[tauri::command]
-fn update_transcript_status(
-    app_handle: tauri::AppHandle,
-    id: String,
-    status: String,
-) -> Result<(), String> {
-    storage::update_transcript_status_by_id(&app_handle, &id, status)
-}
-
-/// Clear the `is_processing` flag to allow new recording sessions to start.
-/// Called by the frontend at the end of every `doAutoInput` terminal path
-/// (success, AI failure, non-AI). Also auto-cleared by the 65s safety
-/// timeout in `do_stop_recording_impl` as a fallback.
-///
-/// `generation` must match the current `recording_generation` — otherwise
-/// this call came from a stale session (e.g. an AI request that hung past
-/// the 65s safety timeout, then returned after the user already started a
-/// new session). Without this check, a stale call could wrongly clear the
-/// gate of the currently-processing session, letting a third session slip
-/// in while the current one is still wrapping up.
-#[tauri::command]
-fn mark_session_idle(state: tauri::State<'_, AppState>, generation: u64) {
-    let mut inner = state.inner.lock();
-    if !inner.is_processing {
-        return;
+    if optimized.len() > MAX_TEXT_LEN {
+        return Err("text_too_long".to_string());
     }
-    if inner.recording_generation != generation {
-        log::info!(
-            "[mark_session_idle] stale call from generation {} ignored (current is {})",
-            generation, inner.recording_generation
-        );
-        return;
-    }
-    inner.is_processing = false;
-    log::info!(
-        "[mark_session_idle] cleared processing for generation {}",
-        generation
+    let char_count = optimized.chars().count();
+    storage::update_transcript_optimized_by_id(&app_handle, &id, optimized)?;
+    emit_app_log(
+        &app_handle,
+        "info",
+        &format!("已写入 AI 优化结果 [{} 字]", char_count),
     );
+    Ok(())
 }
 
 #[tauri::command]
@@ -799,19 +840,41 @@ fn quit_app(app_handle: tauri::AppHandle) {
     app_handle.exit(0);
 }
 
+/// Mark a window as non-activatable (WS_EX_NOACTIVATE) so it never
+/// steals keyboard focus when clicked.  Used for the recording overlay
+/// to prevent hotkey original-action leaking through the WebView.
+#[cfg(windows)]
+#[tauri::command]
+fn set_window_no_activate(app_handle: tauri::AppHandle, label: String) -> Result<(), String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
+    };
+
+    let window = app_handle
+        .get_webview_window(&label)
+        .ok_or_else(|| format!("窗口 '{}' 不存在", label))?;
+    let hwnd = window.hwnd().map_err(|e| format!("获取 HWND 失败: {}", e))?;
+    let raw: windows_sys::Win32::Foundation::HWND = hwnd.0 as _;
+    unsafe {
+        let ex_style = GetWindowLongW(raw, GWL_EXSTYLE);
+        SetWindowLongW(raw, GWL_EXSTYLE, ex_style | WS_EX_NOACTIVATE as i32);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn start_recording(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    // With the 2026-04 session-lifecycle refactor there is no more
+    // `is_processing` gate. The only thing that prevents a new session from
+    // starting is an *actively recording* session — and even that is handled
+    // by `do_start_recording_impl` itself (idempotent early-return when
+    // `is_recording == true`). Any post-session work (AI optimize, text
+    // output) runs on the frontend and cannot block a new recording.
     let settings = {
         let inner = state.inner.lock();
-        // Reject while the previous session is still wrapping up — same
-        // gate as the global hotkey path, keeps the two entry points in sync.
-        if inner.is_processing {
-            let _ = app_handle.emit("session-busy", "仍在处理中，请稍候");
-            return Err("session busy".to_string());
-        }
         validate_provider_credentials(&inner.settings)?;
         Arc::clone(&inner.settings)
     };
@@ -854,23 +917,51 @@ fn do_start_recording_impl(
     // Check state and set is_recording first, then init outside lock
     // to avoid blocking the entire AppState for up to 3 seconds.
     let use_loopback = settings.audio_source == "system";
-    let (needs_mic, generation) = {
+    let (needs_mic, generation, had_speech_flag, aborted_flag) = {
         let mut inner = state.lock();
         if inner.is_recording {
             return Ok(());
         }
         inner.is_recording = true;
         inner.recording_generation += 1;
-        (!use_loopback && inner.mic_manager.is_none(), inner.recording_generation)
+        // [Codex Q4 fix] Create FRESH atomics per session. Previously we
+        // reset the existing `Arc<AtomicBool>` to false — but that same
+        // Arc was still held by any in-flight old session's ASR task.
+        // Resetting it would erase e.g. an ESC abort flag for the old
+        // session, causing `finalize_session` to emit "ok/no_speech"
+        // instead of "aborted". By allocating new Arcs here, the old
+        // session's task keeps observing its own original flag values.
+        inner.had_speech = Arc::new(AtomicBool::new(false));
+        inner.aborted = Arc::new(AtomicBool::new(false));
+        let had_speech_flag = Arc::clone(&inner.had_speech);
+        let aborted_flag = Arc::clone(&inner.aborted);
+        (
+            !use_loopback && inner.mic_manager.is_none(),
+            inner.recording_generation,
+            had_speech_flag,
+            aborted_flag,
+        )
     };
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let (audio_tx, audio_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    emit_app_log(
+        app_handle,
+        "info",
+        &format!(
+            "已开始录音 [{} / {} / {}，会话 {}]",
+            audio_source_label(&settings.audio_source),
+            provider_label(&settings.provider),
+            input_mode_label(&settings.input_mode),
+            generation
+        ),
+    );
+
     if use_loopback {
         // System audio (WASAPI loopback) — no auto-stop
         emit_log(app_handle, "info", "启动录音 (系统声音捕获)");
-        match loopback::LoopbackCapture::start(audio_tx) {
+        match loopback::LoopbackCapture::start(audio_tx, settings.vad_sensitivity) {
             Ok(lb) => {
                 let mut inner = state.lock();
                 inner.stop_tx = Some(stop_tx);
@@ -910,9 +1001,15 @@ fn do_start_recording_impl(
             let app_for_silence = app_handle.clone();
             let mut inner = state.lock();
             inner.stop_tx = Some(stop_tx);
+            // Apply user-configured VAD settings before this session
+            inner.mic_manager.as_ref().unwrap().set_vad_config(
+                settings.vad_sensitivity,
+                settings.silence_auto_stop_secs,
+            );
             inner.mic_manager.as_ref().unwrap().start_forwarding(
                 audio_tx,
                 Some(move || {
+                    emit_app_log(&app_for_silence, "info", "检测到长时间静音，自动结束本次录音");
                     emit_log(&app_for_silence, "info", "检测到长时间静音，自动停止录音");
                     do_stop_recording_impl(&app_for_silence, &state_for_silence);
                 }),
@@ -925,6 +1022,7 @@ fn do_start_recording_impl(
         RecordingStatusPayload {
             recording: true,
             generation,
+            had_speech: false,
         },
     );
 
@@ -941,7 +1039,16 @@ fn do_start_recording_impl(
                     region: settings.dashscope.region.clone(),
                 },
             };
-            spawn_asr_task(provider, app_handle_clone, audio_rx, stop_rx, state_clone, generation);
+            spawn_asr_task(
+                provider,
+                app_handle_clone,
+                audio_rx,
+                stop_rx,
+                state_clone,
+                generation,
+                had_speech_flag,
+                aborted_flag,
+            );
         }
         "qwen" => {
             let provider = QwenProvider {
@@ -952,7 +1059,16 @@ fn do_start_recording_impl(
                     language: settings.qwen.language.clone(),
                 },
             };
-            spawn_asr_task(provider, app_handle_clone, audio_rx, stop_rx, state_clone, generation);
+            spawn_asr_task(
+                provider,
+                app_handle_clone,
+                audio_rx,
+                stop_rx,
+                state_clone,
+                generation,
+                had_speech_flag,
+                aborted_flag,
+            );
         }
         _ => {
             // Default: Doubao
@@ -967,64 +1083,79 @@ fn do_start_recording_impl(
                     },
                 },
             };
-            spawn_asr_task(provider, app_handle_clone, audio_rx, stop_rx, state_clone, generation);
+            spawn_asr_task(
+                provider,
+                app_handle_clone,
+                audio_rx,
+                stop_rx,
+                state_clone,
+                generation,
+                had_speech_flag,
+                aborted_flag,
+            );
         }
     }
 
     Ok(())
 }
 
+/// Abort the currently-recording session (ESC handler).
+///
+/// Sets the `aborted` flag so the ASR task's `SessionOutcome` will report
+/// `aborted=true`, which in turn makes `finalize_session` emit
+/// `session-ended { status: "aborted" }` and persist any already-received
+/// finals as an `aborted` record (preserving the user's intent: stop this
+/// session, but keep what's already been heard).
+///
+/// The abort path is now a thin wrapper around `do_stop_recording_impl` —
+/// there's no separate "processing" state to deal with because
+/// `is_processing` no longer exists. If the session has already moved on
+/// to the AI-optimize phase on the frontend, the frontend still listens
+/// for `session-force-abort` to clean up its UI state.
 fn abort_current_session_impl(app_handle: &tauri::AppHandle, state: &Arc<Mutex<AppStateInner>>) {
-    // Capture the generation we're aborting BEFORE any state mutation —
-    // see Codex Check 6: abort releases the gate immediately, so the user
-    // could start a new session before the `session-force-abort` event
-    // is delivered. The frontend uses this `generation` to filter out
-    // stale aborts and only act on the matching session.
-    let aborting_generation = state.lock().recording_generation;
-    let is_recording = state.lock().is_recording;
+    let (aborting_generation, is_recording) = {
+        let inner = state.lock();
+        (inner.recording_generation, inner.is_recording)
+    };
+
     if is_recording {
+        emit_app_log(
+            app_handle,
+            "info",
+            &format!("收到 ESC 中止请求 [录音中，会话 {}]", aborting_generation),
+        );
+        // Flip the abort flag BEFORE sending stop_tx so the ASR task sees
+        // it when it runs through its wrap-up code. Release ordering pairs
+        // with the Acquire load in the providers.
+        state.lock().aborted.store(true, Ordering::Release);
         let _ = app_handle.emit("recording-cancelled", "escape");
         do_stop_recording_impl(app_handle, state);
-        {
-            let mut inner = state.lock();
-            if inner.is_processing {
-                inner.is_processing = false;
-                log::info!(
-                    "[abort] cleared is_processing immediately after stop for generation {}",
-                    inner.recording_generation
-                );
-            }
-        }
-        let _ = app_handle.emit(
-            "session-force-abort",
-            SessionAbortPayload {
-                generation: aborting_generation,
-                reason: "escape".to_string(),
-            },
-        );
     } else {
-        {
-            let mut inner = state.lock();
-            if inner.is_processing {
-                inner.is_processing = false;
-                log::info!(
-                    "[abort] cleared is_processing while session was post-processing for generation {}",
-                    inner.recording_generation
-                );
-            }
-        }
-        let _ = app_handle.emit(
-            "session-force-abort",
-            SessionAbortPayload {
-                generation: aborting_generation,
-                reason: "escape".to_string(),
-            },
+        emit_app_log(
+            app_handle,
+            "info",
+            &format!("收到 ESC 中止请求 [非录音中，会话 {}]", aborting_generation),
         );
     }
+
+    let _ = app_handle.emit(
+        "session-force-abort",
+        SessionAbortPayload {
+            generation: aborting_generation,
+            reason: "escape".to_string(),
+        },
+    );
 }
 
 /// Spawn an ASR session task for any provider. Generic over the provider type
 /// to avoid dynamic dispatch (AsrProvider uses RPITIT, not object-safe).
+///
+/// The provider returns a `SessionOutcome` describing how the session ended.
+/// This function is the SINGLE place that calls `finalize_session`, so the
+/// `session-ended` event is guaranteed to fire exactly once per spawned task,
+/// regardless of which exit path the provider took. It also handles cleanup
+/// of the mic/loopback/audio devices and clears `is_recording` if the
+/// provider exited without a matching `do_stop_recording_impl` call.
 fn spawn_asr_task<P: AsrProvider + 'static>(
     provider: P,
     app_handle: tauri::AppHandle,
@@ -1032,128 +1163,364 @@ fn spawn_asr_task<P: AsrProvider + 'static>(
     stop_rx: tokio::sync::oneshot::Receiver<()>,
     state: Arc<Mutex<AppStateInner>>,
     generation: u64,
+    had_speech: Arc<AtomicBool>,
+    aborted: Arc<AtomicBool>,
 ) {
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = provider
-            .run_session(app_handle.clone(), generation, audio_rx, stop_rx)
-            .await
-        {
-            log::error!("ASR session error: {}", e);
-            let _ = app_handle.emit("connection-status", false);
-            let _ = app_handle.emit("asr-error", e);
-        }
+        let outcome = provider
+            .run_session(
+                app_handle.clone(),
+                generation,
+                audio_rx,
+                stop_rx,
+                had_speech.clone(),
+                aborted.clone(),
+            )
+            .await;
 
+        // [Codex Q3c fix] Do NOT emit `connection-status: false` here.
+        // This task runs for the session we spawned; when a new session
+        // has already started before we reach this point, emitting false
+        // would clear the connected indicator of the active new session.
+        // The frontend's `session-ended` handler owns the visual
+        // "disconnected" transition, and it's session-scoped.
+
+        // ── Clean up audio devices and clear is_recording if still set ──
+        //
+        // Two paths arrive here:
+        //   (a) user called `do_stop_recording_impl` → is_recording was
+        //       already flipped to false there, audio devices stopped there
+        //   (b) provider exited on its own (error, FINAL arrived, etc.)
+        //       without a user stop → we need to clean up here
+        //
+        // In both cases we also emit `recording-status: false` so the UI
+        // waveform stops. The source of truth for "session is done" is the
+        // `session-ended` event emitted below by `finalize_session`.
         let loopback = {
             let mut inner = state.lock();
-            let lb = if inner.is_recording && inner.recording_generation == generation {
-                // ASR session ended abnormally (not via user stop).
-                // Only clean up if this is still OUR session (generation matches).
+            let was_still_recording =
+                inner.is_recording && inner.recording_generation == generation;
+            let lb = if was_still_recording {
                 inner.is_recording = false;
-                // Note: do NOT set is_processing=true here. Abnormal exit means
-                // the frontend will receive `asr-error` and close the overlay
-                // without running doAutoInput — there's no pending work to
-                // protect, and the frontend won't call `mark_session_idle`.
                 let lb = inner.loopback.take();
                 if let Some(ref mic) = inner.mic_manager {
                     mic.stop_forwarding();
                 }
-                let _ = app_handle.emit(
-                    "recording-status",
-                    RecordingStatusPayload {
-                        recording: false,
-                        generation,
-                    },
-                );
                 lb
             } else {
                 None
             };
-            // Release mic in on-demand mode after session ends (covers both normal and abnormal exits)
             if !inner.settings.mic_always_on && !inner.is_recording {
                 inner.mic_manager = None;
             }
             lb
         };
-        // Stop loopback outside lock to avoid blocking state access
         if let Some(mut lb) = loopback {
             lb.stop();
         }
+
+        // Emit recording-status(false) so the frontend waveform/overlay
+        // stops. Carries had_speech for legacy compat with frontend code
+        // that still reads it (will be cleaned up in Phase 5).
+        let _ = app_handle.emit(
+            "recording-status",
+            RecordingStatusPayload {
+                recording: false,
+                generation,
+                had_speech: outcome.had_speech,
+            },
+        );
+
+        // ── The authoritative end-of-session event ──
+        // Persists any accumulated text + emits `session-ended`. Exactly
+        // once per session, unconditionally.
+        asr::finalize_session(&app_handle, generation, outcome);
     });
 }
 
 /// Shared recording stop logic.
+///
+/// **2026-04 refactor**: no more `is_processing` gate, no more 65s safety
+/// timeout, no `recording-status(false)` emitted from here. All of that
+/// moved into `spawn_asr_task`, which owns the session-ended moment. This
+/// function is now purely "stop audio capture devices and signal the ASR
+/// task to wrap up" — the ASR task will drive the rest of the lifecycle.
 fn do_stop_recording_impl(app_handle: &tauri::AppHandle, state: &Arc<Mutex<AppStateInner>>) {
-    let generation;
-    let loopback = {
+    let (generation, had_speech, loopback) = {
         let mut inner = state.lock();
         if !inner.is_recording {
             return;
         }
 
-        // Signal ASR loop to stop FIRST — this lets the loop exit via the stop_rx
-        // path and send the final packet before the audio channel closes.
+        // Acquire pairs with the Release in `wait_for_speech` to establish
+        // the happens-before needed on weakly-ordered architectures.
+        let had_speech = inner.had_speech.load(Ordering::Acquire);
+
+        // Signal ASR loop to stop FIRST — this lets the loop exit via the
+        // stop_rx path and send the final packet before the audio channel
+        // closes.
         if let Some(stop_tx) = inner.stop_tx.take() {
             let _ = stop_tx.send(());
         }
-        // Take loopback out of lock — stop() calls thread::join() which may block
+        // Take loopback out of lock — stop() calls thread::join() which
+        // may block.
         let lb = inner.loopback.take();
-        // Then stop forwarding audio (closes the sender, stream stays open)
+        // Stop forwarding audio (closes the sender, stream stays open).
         if let Some(ref mic) = inner.mic_manager {
             mic.stop_forwarding();
         }
-        // Atomic transition in the same critical section:
-        //   is_recording: true → false
-        //   is_processing: false → true   ← blocks new sessions from hotkey/button
-        // until the frontend's doAutoInput pipeline calls `mark_session_idle`.
+        // Flip is_recording=false immediately. The ASR task's wrap-up
+        // (sending final packet, waiting for FINAL) continues in the
+        // background and, critically, **does not block a new recording**
+        // from starting. The next `do_start_recording_impl` will
+        // increment generation and spin up a fresh session.
         inner.is_recording = false;
-        inner.is_processing = true;
-        generation = inner.recording_generation;
-        lb
+        let generation = inner.recording_generation;
+        (generation, had_speech, lb)
     }; // lock released here
 
-    // Stop loopback AFTER releasing lock to avoid blocking state access
+    // Stop loopback AFTER releasing lock to avoid blocking state access.
     if let Some(mut lb) = loopback {
         lb.stop();
     }
 
-    // Safety timeout: if the frontend never calls `mark_session_idle`
-    // (JS crash, AI optimize hang, etc.), force-clear `is_processing`
-    // after 65 seconds. This is slightly longer than the AI optimize
-    // default `max_request_secs=60` to avoid racing with a late success.
-    // Only clears if the generation still matches — i.e., the user hasn't
-    // already started a new session that was approved by some other path.
-    {
-        let state_clone = state.clone();
-        tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(65)).await;
-            let mut inner = state_clone.lock();
-            if inner.is_processing && inner.recording_generation == generation {
-                inner.is_processing = false;
-                log::warn!(
-                    "[is_processing safety timeout] force-cleared for generation {}",
-                    generation
-                );
-            }
-        });
-    }
-
-    emit_log(app_handle, "info", "录音已停止");
-    let _ = app_handle.emit(
-        "recording-status",
-        RecordingStatusPayload {
-            recording: false,
-            generation,
+    let stop_message = if had_speech {
+        format!("已结束录音，等待识别结果 [会话 {}]", generation)
+    } else {
+        format!("已结束录音，未检测到有效语音 [会话 {}]", generation)
+    };
+    emit_app_log(app_handle, "info", &stop_message);
+    emit_log(
+        app_handle,
+        "info",
+        if had_speech {
+            "录音已停止"
+        } else {
+            "录音已停止 (未检测到语音)"
         },
     );
+    // NOTE: `recording-status(false)` is emitted by spawn_asr_task once the
+    // ASR task actually exits — that's the honest moment to tell the UI
+    // "the session is really done", and it's paired with `session-ended`
+    // which carries the full result. Emitting it here would be a lie
+    // (the ASR task may still be sending the final audio packet).
+}
+
+// ── System Tray Menu ──
+
+/// Build the full tray right-click menu from current settings, prompts,
+/// and AI providers. Called at startup and whenever any of these change.
+fn build_tray_menu(
+    app: &tauri::AppHandle,
+    settings: &AppSettings,
+    prompts: &[ai::prompts::PromptTemplate],
+    ai_providers: &[ai::providers::AiProvider],
+) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{
+        CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder,
+    };
+
+    let show_item = MenuItemBuilder::with_id("tray_show", "打开窗口").build(app)?;
+    let sep1 = PredefinedMenuItem::separator(app)?;
+
+    // ── AI 优化区 ──
+    let ai_item = CheckMenuItemBuilder::with_id("tray_ai", "AI 优化")
+        .checked(settings.ai_optimize.enabled)
+        .build(app)?;
+
+    // 提示词子菜单
+    let mut prompt_sub = SubmenuBuilder::with_id(app, "tray_prompt_sub", "提示词");
+    if prompts.is_empty() {
+        prompt_sub = prompt_sub.item(
+            &MenuItemBuilder::with_id("tray_prompt_empty", "(无提示词)")
+                .enabled(false)
+                .build(app)?,
+        );
+    } else {
+        for p in prompts {
+            prompt_sub = prompt_sub.item(
+                &CheckMenuItemBuilder::with_id(format!("tray_prompt_{}", p.id), &p.name)
+                    .checked(settings.ai_optimize.active_prompt_id == p.id)
+                    .build(app)?,
+            );
+        }
+    }
+    let prompt_submenu = prompt_sub.build()?;
+
+    // AI 供应商子菜单
+    let mut aiprov_sub = SubmenuBuilder::with_id(app, "tray_aiprov_sub", "AI 供应商");
+    if ai_providers.is_empty() {
+        aiprov_sub = aiprov_sub.item(
+            &MenuItemBuilder::with_id("tray_aiprov_empty", "(未配置)")
+                .enabled(false)
+                .build(app)?,
+        );
+    } else {
+        for p in ai_providers {
+            aiprov_sub = aiprov_sub.item(
+                &CheckMenuItemBuilder::with_id(format!("tray_aiprov_{}", p.id), &p.name)
+                    .checked(settings.ai_optimize.active_provider_id == p.id)
+                    .build(app)?,
+            );
+        }
+    }
+    let aiprov_submenu = aiprov_sub.build()?;
+
+    let sep2 = PredefinedMenuItem::separator(app)?;
+
+    // ── 识别/音频/输出区 ──
+    let asr_submenu = SubmenuBuilder::with_id(app, "tray_asr_sub", "识别供应商")
+        .item(
+            &CheckMenuItemBuilder::with_id("tray_asr_doubao", "豆包")
+                .checked(settings.provider == "doubao")
+                .build(app)?,
+        )
+        .item(
+            &CheckMenuItemBuilder::with_id("tray_asr_dashscope", "百炼")
+                .checked(settings.provider == "dashscope")
+                .build(app)?,
+        )
+        .item(
+            &CheckMenuItemBuilder::with_id("tray_asr_qwen", "千问")
+                .checked(settings.provider == "qwen")
+                .build(app)?,
+        )
+        .build()?;
+
+    let audio_submenu = SubmenuBuilder::with_id(app, "tray_audio_sub", "音频来源")
+        .item(
+            &CheckMenuItemBuilder::with_id("tray_audio_microphone", "麦克风")
+                .checked(settings.audio_source == "microphone")
+                .build(app)?,
+        )
+        .item(
+            &CheckMenuItemBuilder::with_id("tray_audio_system", "系统声音")
+                .checked(settings.audio_source == "system")
+                .build(app)?,
+        )
+        .build()?;
+
+    let output_submenu = SubmenuBuilder::with_id(app, "tray_output_sub", "输出方式")
+        .item(
+            &CheckMenuItemBuilder::with_id("tray_output_type", "打字模拟")
+                .checked(settings.output_mode == "type")
+                .build(app)?,
+        )
+        .item(
+            &CheckMenuItemBuilder::with_id("tray_output_paste", "粘贴输入")
+                .checked(settings.output_mode == "paste")
+                .build(app)?,
+        )
+        .item(
+            &CheckMenuItemBuilder::with_id("tray_output_none", "仅识别")
+                .checked(settings.output_mode == "none")
+                .build(app)?,
+        )
+        .build()?;
+
+    let sep3 = PredefinedMenuItem::separator(app)?;
+
+    // ── 底部区 ──
+    let stats_item = MenuItemBuilder::with_id("tray_stats", "统计").build(app)?;
+    let about_item = MenuItemBuilder::with_id("tray_about", "关于 SpeakIn声入").build(app)?;
+    let quit_item = MenuItemBuilder::with_id("tray_quit", "退出").build(app)?;
+
+    MenuBuilder::new(app)
+        .items(&[
+            &show_item,
+            &sep1,
+            &ai_item,
+            &prompt_submenu,
+            &aiprov_submenu,
+            &sep2,
+            &asr_submenu,
+            &audio_submenu,
+            &output_submenu,
+            &sep3,
+            &stats_item,
+            &about_item,
+            &quit_item,
+        ])
+        .build()
+}
+
+/// Rebuild the tray menu from current AppState. Safe to call from any
+/// thread — reads state, builds a fresh menu, and swaps it in.
+fn rebuild_tray_menu(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let settings = state.inner.lock().settings.clone();
+    let prompts = state.cached_prompts.lock().prompts.clone();
+    let providers = state.cached_providers.lock().providers.clone();
+
+    match build_tray_menu(app, &settings, &prompts, &providers) {
+        Ok(menu) => {
+            if let Some(tray) = app.tray_by_id("main") {
+                let _ = tray.set_menu(Some(menu));
+            }
+        }
+        Err(e) => log::error!("Failed to rebuild tray menu: {}", e),
+    }
+}
+
+/// Modify a setting field, persist, notify frontend, and refresh tray.
+///
+/// NOTE: This bypasses `normalize_settings_for_save` and the side-effect
+/// handling in the `save_settings` Tauri command (hotkey re-registration,
+/// mic manager toggle, etc.) because the tray menu only mutates fields
+/// that don't require those steps (provider, audio_source, output_mode,
+/// ai_optimize.*).  If the tray ever gains controls for hotkey or
+/// mic_always_on, route those through the full save_settings path instead.
+fn tray_update_setting(app: &tauri::AppHandle, f: impl FnOnce(&mut AppSettings)) {
+    let state = app.state::<AppState>();
+    let new_settings = {
+        let mut inner = state.inner.lock();
+        let mut s = (*inner.settings).clone();
+        f(&mut s);
+        inner.settings = Arc::new(s.clone());
+        s
+    };
+    let _ = storage::save_settings(app, &new_settings);
+    let _ = app.emit("settings-changed", ());
+    rebuild_tray_menu(app);
+}
+
+/// Show the main window and bring it to focus.
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+/// Tauri command: rebuild tray menu after frontend settings/prompts/providers change.
+#[tauri::command]
+fn rebuild_tray_menu_cmd(app: tauri::AppHandle) {
+    rebuild_tray_menu(&app);
 }
 
 // ── App Setup ──
+
+/// Uninstall-time entry point. Invoked by `main.rs` when the binary is
+/// started with the hidden `--uninstall-cleanup` flag from the NSIS
+/// PreUninstall hook after the user checks "delete app data". Does NOT start
+/// Tauri — only removes OS keyring credentials this app wrote. See
+/// `storage::uninstall_cleanup` for the full safety contract.
+#[cfg(windows)]
+pub fn run_uninstall_cleanup() {
+    storage::uninstall_cleanup();
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // 第二个实例启动时，聚焦已有窗口
+            log::info!("检测到第二个实例，聚焦已有窗口");
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
@@ -1169,11 +1536,9 @@ pub fn run() {
             abort_current_session,
             set_escape_abort_active,
             list_audio_devices,
+            measure_microphone_level,
             send_text_input,
-            save_transcript_record,
             update_transcript_optimized,
-            update_transcript_status,
-            mark_session_idle,
             get_transcript_records,
             clear_transcript_records,
             get_usage_stats,
@@ -1193,6 +1558,8 @@ pub fn run() {
             ai::ai_optimize_text,
             ai::get_prompts,
             ai::save_prompts,
+            rebuild_tray_menu_cmd,
+            set_window_no_activate,
         ])
         .setup(|app| {
             let app_handle = app.handle().clone();
@@ -1244,8 +1611,9 @@ pub fn run() {
             let state = AppState {
                 inner: Arc::new(Mutex::new(AppStateInner {
                     is_recording: false,
-                    is_processing: false,
                     recording_generation: 0,
+                    had_speech: Arc::new(AtomicBool::new(false)),
+                    aborted: Arc::new(AtomicBool::new(false)),
                     settings: Arc::new(settings.clone()),
                     mic_manager,
                     loopback: None,
@@ -1263,77 +1631,112 @@ pub fn run() {
 
             // ── System Tray ──
             {
-                use tauri::menu::{
-                    CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, PredefinedMenuItem,
-                };
                 use tauri::tray::{
                     MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
                 };
 
-                let show_item =
-                    MenuItemBuilder::with_id("tray_show", "打开窗口").build(app)?;
-                let ai_item = CheckMenuItemBuilder::with_id("tray_ai", "AI 优化")
-                    .checked(settings.ai_optimize.enabled)
-                    .build(app)?;
-                let sep = PredefinedMenuItem::separator(app)?;
-                let about_item =
-                    MenuItemBuilder::with_id("tray_about", "关于 SpeakIn").build(app)?;
-                let quit_item =
-                    MenuItemBuilder::with_id("tray_quit", "退出").build(app)?;
-                let menu = MenuBuilder::new(app)
-                    .items(&[&show_item, &ai_item, &sep, &about_item, &quit_item])
-                    .build()?;
+                let app_state = app_handle.state::<AppState>();
+                let prompts = app_state.cached_prompts.lock().prompts.clone();
+                let providers = app_state.cached_providers.lock().providers.clone();
+                let menu = build_tray_menu(
+                    &app_handle,
+                    &settings,
+                    &prompts,
+                    &providers,
+                )?;
 
-                let tray_state = state_inner.clone();
-                let tray_app = app_handle.clone();
-
-                // Tray icon: load a small PNG (32x32) directly so Windows
-                // doesn't have to downscale a 512x512 master at runtime.
-                // See `scripts/gen_icons.py` for how this asset is generated.
                 let tray_icon = tauri::image::Image::from_bytes(include_bytes!(
                     "../icons/tray.png"
                 ))?;
 
-                TrayIconBuilder::new()
+                TrayIconBuilder::with_id("main")
                     .icon(tray_icon)
-                    .tooltip("SpeakIn 声入")
+                    .tooltip("SpeakIn声入")
                     .menu(&menu)
                     .show_menu_on_left_click(false)
-                    .on_menu_event(move |app, event| {
-                        match event.id().as_ref() {
-                            "tray_show" => {
-                                if let Some(w) = app.get_webview_window("main") {
-                                    let _ = w.show();
-                                    let _ = w.unminimize();
-                                    let _ = w.set_focus();
-                                }
-                            }
+                    .on_menu_event(|app, event| {
+                        let id = event.id().as_ref().to_string();
+                        match id.as_str() {
+                            "tray_show" => show_main_window(app),
+
                             "tray_ai" => {
-                                // Toggle AI optimize and persist.
-                                // Clone settings and drop lock BEFORE save (keyring I/O).
-                                let new_settings = {
-                                    let mut inner = tray_state.lock();
-                                    let mut s = (*inner.settings).clone();
+                                tray_update_setting(app, |s| {
                                     s.ai_optimize.enabled = !s.ai_optimize.enabled;
-                                    inner.settings = Arc::new(s.clone());
-                                    s
-                                };
-                                let _ = storage::save_settings(&tray_app, &new_settings);
-                                let _ = tray_app.emit("settings-changed", ());
+                                });
                             }
+
                             "tray_about" => {
-                                // Show window and emit about event to frontend
-                                if let Some(w) = app.get_webview_window("main") {
-                                    let _ = w.show();
-                                    let _ = w.unminimize();
-                                    let _ = w.set_focus();
-                                }
+                                show_main_window(app);
                                 let _ = app.emit("show-about", ());
                             }
-                            "tray_quit" => {
-                                app.exit(0);
+
+                            "tray_stats" => {
+                                show_main_window(app);
+                                let _ = app.emit("show-stats", ());
                             }
-                            _ => {}
+
+                            "tray_quit" => app.exit(0),
+
+                            // ASR 供应商
+                            "tray_asr_doubao" => {
+                                tray_update_setting(app, |s| {
+                                    s.provider = "doubao".into();
+                                });
+                            }
+                            "tray_asr_dashscope" => {
+                                tray_update_setting(app, |s| {
+                                    s.provider = "dashscope".into();
+                                });
+                            }
+                            "tray_asr_qwen" => {
+                                tray_update_setting(app, |s| {
+                                    s.provider = "qwen".into();
+                                });
+                            }
+
+                            // 音频来源
+                            "tray_audio_microphone" => {
+                                tray_update_setting(app, |s| {
+                                    s.audio_source = "microphone".into();
+                                });
+                            }
+                            "tray_audio_system" => {
+                                tray_update_setting(app, |s| {
+                                    s.audio_source = "system".into();
+                                });
+                            }
+
+                            // 输出方式
+                            "tray_output_type" => {
+                                tray_update_setting(app, |s| {
+                                    s.output_mode = "type".into();
+                                });
+                            }
+                            "tray_output_paste" => {
+                                tray_update_setting(app, |s| {
+                                    s.output_mode = "paste".into();
+                                });
+                            }
+                            "tray_output_none" => {
+                                tray_update_setting(app, |s| {
+                                    s.output_mode = "none".into();
+                                });
+                            }
+
+                            _ => {
+                                // 动态 ID：提示词 / AI 供应商
+                                if let Some(prompt_id) = id.strip_prefix("tray_prompt_") {
+                                    let pid = prompt_id.to_string();
+                                    tray_update_setting(app, |s| {
+                                        s.ai_optimize.active_prompt_id = pid;
+                                    });
+                                } else if let Some(prov_id) = id.strip_prefix("tray_aiprov_") {
+                                    let pid = prov_id.to_string();
+                                    tray_update_setting(app, |s| {
+                                        s.ai_optimize.active_provider_id = pid;
+                                    });
+                                }
+                            }
                         }
                     })
                     .on_tray_icon_event(|tray, event| {
@@ -1343,11 +1746,7 @@ pub fn run() {
                             ..
                         } = event
                         {
-                            if let Some(w) = tray.app_handle().get_webview_window("main") {
-                                let _ = w.show();
-                                let _ = w.unminimize();
-                                let _ = w.set_focus();
-                            }
+                            show_main_window(tray.app_handle());
                         }
                     })
                     .build(app)?;
@@ -1398,26 +1797,18 @@ pub fn run() {
                             last_event_time = now;
                             // ⚠️ Mutex safety: must drop guard before calling
                             // do_stop/do_start which re-lock the same mutex.
-                            let (is_recording, is_processing, settings) = {
+                            let (is_recording, settings) = {
                                 let inner = state.lock();
-                                (
-                                    inner.is_recording,
-                                    inner.is_processing,
-                                    Arc::clone(&inner.settings),
-                                )
+                                (inner.is_recording, Arc::clone(&inner.settings))
                             };
                             if is_recording {
+                                emit_app_log(&app_handle, "info", "全局热键：请求结束录音");
                                 do_stop_recording_impl(&app_handle, &state);
-                            } else if is_processing {
-                                // Previous session still wrapping up (ASR final /
-                                // AI optimize). Reject and notify frontend.
-                                last_event_time -= HOTKEY_COOLDOWN; // don't burn the cooldown
-                                let _ = app_handle.emit(
-                                    "session-busy",
-                                    "仍在处理中，请稍候",
-                                );
                             } else if let Err(e) =
-                                do_start_recording_impl(&app_handle, &state, &settings)
+                                {
+                                    emit_app_log(&app_handle, "info", "全局热键：请求开始录音");
+                                    do_start_recording_impl(&app_handle, &state, &settings)
+                                }
                             {
                                 let _ = app_handle.emit("asr-error", format!("启动失败: {}", e));
                             }
@@ -1432,26 +1823,17 @@ pub fn run() {
                             }
                             last_event_time = now;
 
-                            let (is_recording, is_processing, settings) = {
+                            let (is_recording, settings) = {
                                 let inner = state.lock();
-                                (
-                                    inner.is_recording,
-                                    inner.is_processing,
-                                    Arc::clone(&inner.settings),
-                                )
+                                (inner.is_recording, Arc::clone(&inner.settings))
                             };
                             if is_recording {
                                 // Already recording — ignore (hold mode shouldn't re-enter)
-                            } else if is_processing {
-                                // Previous session still wrapping up. Reject and notify.
-                                last_event_time -= HOTKEY_COOLDOWN;
-                                hold_start_instant = None;
-                                let _ = app_handle.emit(
-                                    "session-busy",
-                                    "仍在处理中，请稍候",
-                                );
                             } else if let Err(e) =
-                                do_start_recording_impl(&app_handle, &state, &settings)
+                                {
+                                    emit_app_log(&app_handle, "info", "全局热键按下：开始录音");
+                                    do_start_recording_impl(&app_handle, &state, &settings)
+                                }
                             {
                                 let _ =
                                     app_handle.emit("asr-error", format!("启动失败: {}", e));
@@ -1468,15 +1850,18 @@ pub fn run() {
 
                             if is_mistouch {
                                 log::info!("Hold duration too short, treating as mistouch — cancelling");
+                                emit_app_log(&app_handle, "info", "全局热键释放：判定为误触，取消本次录音");
                                 // Emit cancel BEFORE stop so frontend sees it before recording-status(false)
                                 let _ = app_handle.emit("recording-cancelled", "mistouch");
                                 do_stop_recording_impl(&app_handle, &state);
                             } else {
+                                emit_app_log(&app_handle, "info", "全局热键释放：请求结束录音");
                                 do_stop_recording_impl(&app_handle, &state);
                             }
                         }
                         HotkeyEvent::AbortSession => {
                             hold_start_instant = None;
+                            emit_app_log(&app_handle, "info", "全局 ESC：请求中止当前会话");
                             abort_current_session_impl(&app_handle, &state);
                         }
                     }

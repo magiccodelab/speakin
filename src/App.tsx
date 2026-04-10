@@ -68,12 +68,15 @@ export interface AppSettings {
   theme_color: string;
   recording_follows_theme: boolean;
   show_overlay: boolean;
+  show_overlay_subtitle: boolean;
   close_behavior: "ask" | "minimize" | "quit";
   onboarding_completed: boolean;
   copy_to_clipboard: boolean;
   paste_restore_clipboard: boolean;
   system_no_auto_stop: boolean;
   esc_abort_enabled: boolean;
+  silence_auto_stop_secs: number;
+  vad_sensitivity: number;
 }
 
 interface TranscriptPayload {
@@ -85,6 +88,29 @@ interface TranscriptPayload {
 interface RecordingStatusPayload {
   recording: boolean;
   generation: number;
+  /**
+   * For `recording: false` emits, true iff VAD observed any speech in
+   * this session. Kept for legacy compat — the new session-ended event
+   * is authoritative for end-of-session logic.
+   */
+  had_speech?: boolean;
+}
+
+/**
+ * Single source of truth for "session is done" (2026-04 refactor).
+ * Replaces the old asr-error + recording-status(false) + mark_session_idle
+ * triangle. The backend owns session lifecycle now: it accumulates finals,
+ * persists them on any exit path, and emits this payload exactly once.
+ * Frontend just reacts — no gate to release, no rescue logic.
+ */
+interface SessionEndedPayload {
+  generation: number;
+  final_text: string;
+  status: "ok" | "no_speech" | "error" | "aborted";
+  error_reason?: string | null;
+  error_detail?: string | null;
+  duration_ms: number;
+  record_id?: string | null;
 }
 
 export interface LogEntry {
@@ -138,20 +164,44 @@ const DEFAULT_SETTINGS: AppSettings = {
   theme_color: "blue",
   recording_follows_theme: true,
   show_overlay: true,
+  show_overlay_subtitle: true,
   close_behavior: "ask",
   onboarding_completed: false,
   copy_to_clipboard: false,
   paste_restore_clipboard: true,
   system_no_auto_stop: false,
   esc_abort_enabled: true,
+  silence_auto_stop_secs: 6,
+  vad_sensitivity: 7,
 };
 
-/** Simplify raw backend error strings for non-debug display. */
-function simplifyError(raw: string): string {
-  if (raw.includes("连接失败")) return "语音服务连接失败，检查网络后重试";
-  if (raw.includes("超时")) return "语音服务响应超时";
-  if (raw.includes("401") || raw.includes("403")) return "语音服务鉴权失败，检查凭据后重试";
-  return "语音识别出错，稍后重试";
+/** Show "正在努力识别中" after the post-recording wait exceeds this. UX only. */
+const SLOW_HINT_MS = 3000;
+/** How long the red error waveform lingers before returning to idle. */
+const ERROR_FLASH_MS = 2200;
+const MAX_LOG_ENTRIES = 200;
+const APP_LOG_PREFIX = "[APP]";
+const AI_LOG_PREFIX = "[AI]";
+
+function formatLogTimestamp(date = new Date()): string {
+  const pad = (value: number, width = 2) => String(value).padStart(width, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
+}
+
+function normalizeLogEntry(entry: LogEntry): LogEntry {
+  if (/^\d{4}-\d{2}-\d{2} /.test(entry.ts)) {
+    return entry;
+  }
+  return { ...entry, ts: `${formatLogTimestamp().slice(0, 10)} ${entry.ts}` };
+}
+
+function shouldKeepLogEntry(entry: LogEntry): boolean {
+  const msg = entry.msg ?? "";
+  return msg.startsWith(APP_LOG_PREFIX)
+    || msg.startsWith(AI_LOG_PREFIX)
+    || entry.level === "warn"
+    || entry.level === "error";
 }
 
 export default function App() {
@@ -166,41 +216,25 @@ export default function App() {
   const isRecordingRef = useRef(false);
   const transcriptRef = useRef("");
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
-  const autoInputTimerRef = useRef<number | null>(null);
-  // [Batch 2] 3s soft-hint timer — when post-recording waits > 3s for ASR
-  // FINAL, flip `isProcessingSlow` so the UI shows "正在努力识别中" instead of
-  // "识别中". Cleared on FINAL arrival, new session, forced abort, or error.
+  // UX-only: when post-recording wait exceeds SLOW_HINT_MS, flip to
+  // "正在努力识别中". Cleared when session-ended arrives.
   const slowHintTimerRef = useRef<number | null>(null);
   const [isProcessingSlow, setIsProcessingSlow] = useState(false);
-  const textSentRef = useRef(false);
-  // Two distinct session counters, by design:
-  //   sessionIdRef       — frontend-owned, increments on recording-status(true).
-  //                        Gates AI optimize callbacks and overlay-phase events
-  //                        (both are frontend-initiated flows).
-  //   backendGenerationRef — shadow of backend's recording_generation.
-  //                        Updated from recording-status AND self-heals when
-  //                        transcription-update arrives with a newer generation
-  //                        (Tauri cross-thread emit is not strictly ordered).
-  //                        Used to filter ASR transcription events from stale sessions.
-  // The two don't have to agree on value, just each monotonically increase.
+  // Two distinct session counters:
+  //   sessionIdRef       — frontend-owned, increments on each new recording.
+  //                        Scopes AI optimize callbacks to the session that
+  //                        started them.
+  //   backendGenerationRef — shadow of backend's recording_generation,
+  //                        authoritative for "which session is current".
+  //                        Used to filter stale transcription-update events
+  //                        and to guard late AI-optimize auto-paste from
+  //                        typing into a newer session's focus target.
   const sessionIdRef = useRef(0);
   const backendGenerationRef = useRef(0);
-  // [修订 R2] Tracks whether the current session's text has been persisted to
-  // history. Independent from textSentRef (which only means "doAutoInput has
-  // been entered"). Used by the new-session rescue block to decide whether
-  // to flush pending text from a session whose doAutoInput never reached
-  // save_transcript_record (e.g., AI optimize hung on the network).
-  const persistedRef = useRef(false);
-  // [Codex Check 7a fix] Stores the record id returned by doAutoInput's
-  // Step 1 save_transcript_record. Used by handleForcedSessionAbort to
-  // promote the saved record's status from "partial" → "aborted" when
-  // the user presses ESC during the AI optimize phase. Cleared on every
-  // new session start.
-  const currentRecordIdRef = useRef<string | null>(null);
-  // Ref mirror of `interimText` state — event listeners can't read current
-  // state values from closures. Must be kept in sync via `setInterimTextBoth`.
+  // Ref mirror of `interimText` state — event listeners read this from
+  // closures. Must be kept in sync via `setInterimTextBoth`.
   const interimTextRef = useRef("");
-  const [isPostRecording, setIsPostRecording] = useState(false); // ASR processing after recording stops
+  const [isPostRecording, setIsPostRecording] = useState(false);
   const [isOptimizing, setIsOptimizing] = useState(false);
   const [optimizedText, setOptimizedText] = useState("");
   const [closeDialogOpen, setCloseDialogOpen] = useState(false);
@@ -213,13 +247,34 @@ export default function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [transcriptRefreshKey, setTranscriptRefreshKey] = useState(0);
   const toastTimerRef = useRef<number | null>(null);
+  // Pending settings: saved to backend immediately, but App state deferred
+  // until panel closes to avoid re-render flash behind backdrop-blur.
+  const pendingSettingsRef = useRef<AppSettings | null>(null);
   const settingsRef = useRef(settings);
-  settingsRef.current = settings;
+  // Skip sync when a pending save hasn't propagated to React state yet,
+  // otherwise a re-render between save and panel-close would clobber the
+  // eagerly-written ref with stale React state.
+  if (!pendingSettingsRef.current) {
+    settingsRef.current = settings;
+  }
+  const appendLogEntry = useCallback((entry: LogEntry) => {
+    if (!shouldKeepLogEntry(entry)) return;
+    const normalized = normalizeLogEntry(entry);
+    setLogs((prev) => [...prev.slice(-(MAX_LOG_ENTRIES - 1)), normalized]);
+  }, []);
+  const appendLocalLog = useCallback((level: LogEntry["level"], msg: string) => {
+    appendLogEntry({
+      ts: formatLogTimestamp(),
+      level,
+      msg: `${APP_LOG_PREFIX} ${msg}`,
+    });
+  }, [appendLogEntry]);
   const recordingStartTimeRef = useRef(0);
-  const errorHandledRef = useRef(false); // Prevents asr-error + recording-status(false) race
-  const cancelledRef = useRef(false); // Mistouch cancel — skip post-recording flow
-  const forcedAbortRef = useRef(false); // Manual abort — ignore late ASR/AI callbacks
-  const aiLogs = logs.filter((log) => log.msg.includes("[AI]"));
+  // Set on ESC abort — guards AI optimize callbacks so we don't output
+  // AI-optimized text from a session the user just cancelled. Reset on
+  // every new session start.
+  const forcedAbortRef = useRef(false);
+  const aiLogs = logs.filter((log) => log.msg.startsWith(AI_LOG_PREFIX));
   const latestAiLogText = aiLogs.map((log) => `[${log.ts}] ${log.level.toUpperCase()} ${log.msg}`).join("\n\n");
 
   // Helper: update both the React state AND the ref mirror in lockstep.
@@ -230,28 +285,19 @@ export default function App() {
     setInterimText(value);
   }, []);
 
-  type OverlayPhase = "recording" | "processing" | "optimizing" | "idle";
+  type OverlayPhase = "recording" | "processing" | "optimizing" | "error" | "idle";
   const emitOverlayPhase = useCallback((phase: OverlayPhase) => {
     emit("overlay-phase", { phase, sessionId: sessionIdRef.current });
   }, []);
 
-  // [Batch 2] Clear both post-recording timers (force-advance + soft-hint)
-  // and reset the slow-hint flag. Must be called on every path that exits
-  // the post-recording phase, otherwise the 6s force-advance may fire
-  // against a new session or the hint state leaks across sessions.
-  // [Codex Check 5 fix] All overlay-slow emits carry the current
-  // sessionId. The overlay window filters out events from stale sessions
-  // so a late-arriving `slow=true` from a previous session can never
-  // override a freshly reset state.
+  // Overlay window filters stale slow-hint emits by sessionId so a
+  // late-arriving slow=true from a previous session can never override
+  // a freshly reset state.
   const emitOverlaySlow = useCallback((slow: boolean) => {
     emit("overlay-slow", { slow, sessionId: sessionIdRef.current }).catch(() => {});
   }, []);
 
-  const clearPostRecordingTimers = useCallback(() => {
-    if (autoInputTimerRef.current !== null) {
-      window.clearTimeout(autoInputTimerRef.current);
-      autoInputTimerRef.current = null;
-    }
+  const clearSlowHintTimer = useCallback(() => {
     if (slowHintTimerRef.current !== null) {
       window.clearTimeout(slowHintTimerRef.current);
       slowHintTimerRef.current = null;
@@ -264,105 +310,6 @@ export default function App() {
     setIsPostRecording(false);
     hideOverlay();
   }, []);
-
-  const handleForcedSessionAbort = useCallback(() => {
-    forcedAbortRef.current = true;
-    cancelledRef.current = isRecordingRef.current;
-    textSentRef.current = true;
-
-    // ── ESC abort rescue ──────────────────────────────────────────────
-    // Save whatever first-pass text the user already saw on screen
-    // (transcript + interim) as an "aborted" history record before
-    // wiping state. The user's intent in pressing ESC is "stop this
-    // session", not "throw away what you already heard" — Doubao's
-    // first-pass interim is still valuable.
-    //
-    // Two cases:
-    //   1. persistedRef === true: doAutoInput Step 1 already saved the
-    //      raw text as a "partial" record (ESC during AI optimize). Use
-    //      currentRecordIdRef to promote partial → aborted via the new
-    //      update_transcript_status command. [Codex Check 7a fix]
-    //   2. persistedRef === false: nothing saved yet. Save now as
-    //      "aborted" directly. [Codex Check 7b: track save success
-    //      precisely so a failure shows a banner instead of silently
-    //      dropping content.]
-    let attemptedSave = false;
-    if (persistedRef.current && currentRecordIdRef.current) {
-      // Case 1: promote existing partial record to aborted.
-      const idToUpdate = currentRecordIdRef.current;
-      invoke("update_transcript_status", {
-        id: idToUpdate,
-        status: "aborted",
-      })
-        .then(() => setTranscriptRefreshKey((k) => k + 1))
-        .catch((err) => {
-          // Record may have been evicted; not user-visible enough to
-          // alert, just log.
-          console.warn("ESC promote partial→aborted failed:", err);
-        });
-    } else if (!persistedRef.current) {
-      const parts = [transcriptRef.current, interimTextRef.current]
-        .filter((s): s is string => typeof s === "string" && s.trim().length > 0);
-      if (parts.length > 0) {
-        attemptedSave = true;
-        const pending = parts.join("\n");
-        const durationMs = recordingStartTimeRef.current > 0
-          ? Date.now() - recordingStartTimeRef.current
-          : 0;
-        invoke<string>("save_transcript_record", {
-          original: pending,
-          optimized: null,
-          durationMs,
-          status: "aborted",
-        })
-          .then(() => {
-            persistedRef.current = true;
-            setTranscriptRefreshKey((k) => k + 1);
-          })
-          .catch((err) => {
-            if (err === "empty_text") {
-              // Race: text was effectively empty after backend processing
-              // (filler/replacements stripped it). Treat as persisted to
-              // avoid stale rescue attempts.
-              persistedRef.current = true;
-            } else {
-              console.error("ESC abort save failed:", err);
-              setBanner({
-                kind: "error",
-                text: settingsRef.current.debug_mode
-                  ? `中止保存失败: ${err}`
-                  : "中止时保存历史记录失败",
-              });
-              // Leave persistedRef as-is — there's nothing the rescue can
-              // do (state already cleared), but at least the user was
-              // notified.
-            }
-          });
-      }
-    }
-
-    // If we didn't attempt a save (no pending text, OR doAutoInput already
-    // persisted as "partial"), mark as persisted so the new-session rescue
-    // skips it. The async save's .then() handles the success path above.
-    if (!attemptedSave) {
-      persistedRef.current = true;
-    }
-    clearPostRecordingTimers();
-    setTranscript("");
-    setInterimTextBoth("");
-    setOptimizedText("");
-    transcriptRef.current = "";
-    setIsPostRecording(false);
-    setIsOptimizing(false);
-    emitOverlayPhase("idle");
-    closeOverlay();
-    // Release the backend is_processing gate — the forced-abort flow never
-    // reaches doAutoInput's .finally block (forcedAbortRef short-circuits it),
-    // so the backend would otherwise wait for the 65s safety timeout.
-    invoke("mark_session_idle", {
-      generation: backendGenerationRef.current,
-    }).catch(() => {});
-  }, [closeOverlay, emitOverlayPhase, setInterimTextBoth, clearPostRecordingTimers]);
 
   // showToast hoisted here (ahead of the listener useEffect below) so it's
   // in scope when the useEffect deps array evaluates. TS catches the
@@ -409,6 +356,11 @@ export default function App() {
     applyThemeColor(settings.theme_color, isDark, settings.recording_follows_theme);
   }, [settings.theme_color, settings.recording_follows_theme]);
 
+  // Sync overlay subtitle preference to localStorage for the overlay window to read
+  useEffect(() => {
+    localStorage.setItem("overlay-subtitle", settings.show_overlay_subtitle ? "1" : "0");
+  }, [settings.show_overlay_subtitle]);
+
   useEffect(() => {
     const active = settings.esc_abort_enabled && (isRecording || isPostRecording || isOptimizing);
     invoke("set_escape_abort_active", { active }).catch(() => {});
@@ -417,111 +369,52 @@ export default function App() {
     };
   }, [settings.esc_abort_enabled, isRecording, isPostRecording, isOptimizing]);
 
-  // Auto-input pipeline: persist to history FIRST (so content is safe even
-  // if anything below fails), then AI optimize (if enabled), then paste.
-  //
-  // Why "persist first": the old pipeline bolted `send_text_and_record` to
-  // the tail end of AI optimize, so a hung AI request meant history was
-  // never written. Now the raw text is written to history the moment
-  // doAutoInput starts; AI result (if any) is then appended via
-  // update_transcript_optimized. See Batch 1 plan Fix B.
-  const doAutoInput = useCallback(async (text: string, generation: number) => {
-    if (textSentRef.current || forcedAbortRef.current) return;
-    textSentRef.current = true;
-    // [Batch 2] Slow hint only applies while waiting for FINAL — once
-    // doAutoInput runs we're past that phase, hide the hint. Also
-    // ensures the overlay is in sync if doAutoInput was reached via
-    // the 6s force-advance path.
-    setIsProcessingSlow(false);
-    emitOverlaySlow(false);
-
-    // Update usage statistics
-    const durationMs = recordingStartTimeRef.current > 0
-      ? Date.now() - recordingStartTimeRef.current
-      : 0;
-    if (text && durationMs > 0) {
-      invoke("update_usage_stats", {
-        sessionDurationMs: durationMs,
-        text,
-      }).catch(() => {});
-    }
-
-    const currentSession = sessionIdRef.current;
-    const currentSettings = settingsRef.current;
-
-    // ── Step 1: persist to history (no output, persist-only) ─────────
-    // If AI is enabled, save as "partial" — will be promoted to "done"
-    // by update_transcript_optimized once AI succeeds. If AI is disabled,
-    // this is already the final state so save as "done".
-    let recordId: string | null = null;
-    try {
-      recordId = await invoke<string>("save_transcript_record", {
-        original: text,
-        optimized: null,
-        durationMs,
-        status: currentSettings.ai_optimize.enabled ? "partial" : "done",
-      });
-      persistedRef.current = true;
-      // [Codex Check 7a fix] Expose recordId so ESC abort can promote
-      // partial → aborted if the user cancels during AI optimize.
-      currentRecordIdRef.current = recordId;
-      setTranscriptRefreshKey((k) => k + 1);
-    } catch (e) {
-      // [修订 R6] `empty_text` is expected (empty content shouldn't be saved),
-      // swallow silently. Other errors are real failures worth logging.
-      if (e !== "empty_text") {
-        console.error("Failed to persist transcript:", e);
-      }
-      // recordId stays null — AI success path has a fallback retry (修订 R2)
-    }
-
-    // ── Step 2: AI optimize (if enabled) or direct paste ─────────────
-    if (currentSettings.ai_optimize.enabled) {
+  /**
+   * AI optimize post-processing. Runs AFTER session-ended has delivered
+   * the authoritative raw text + record_id, so the history record
+   * already exists — our job is just:
+   *   1. stream the optimized text into the UI
+   *   2. update the record via update_transcript_optimized
+   *   3. send the optimized text to the focused window, BUT only if
+   *      this session is still the "current" one on the backend. If
+   *      the user has already started a new session, skip the
+   *      send_text_input to avoid typing old text into the new
+   *      focus target (the record_update still happens — user can
+   *      copy from history).
+   */
+  const runAiOptimize = useCallback(
+    async (rawText: string, recordId: string | null, generation: number) => {
+      const mySession = sessionIdRef.current;
       setIsOptimizing(true);
       setOptimizedText("");
       emitOverlayPhase("optimizing");
-      setLogs((prev) => prev.filter((log) => !log.msg.includes("[AI]")));
+      setLogs((prev) => prev.filter((log) => !log.msg.startsWith(AI_LOG_PREFIX)));
 
       try {
         const optimized = await invoke<string>("ai_optimize_text", {
-          text,
-          sessionId: currentSession,
+          text: rawText,
+          sessionId: mySession,
         });
-
-        if (sessionIdRef.current !== currentSession || forcedAbortRef.current) {
-          return; // stale session, drop
-        }
-
+        if (forcedAbortRef.current) return;
         setOptimizedText(optimized);
 
         if (recordId) {
-          // Normal path: update the record we saved in step 1.
-          invoke("update_transcript_optimized", {
-            id: recordId,
-            optimized,
-          })
+          invoke("update_transcript_optimized", { id: recordId, optimized })
             .then(() => setTranscriptRefreshKey((k) => k + 1))
             .catch(() => {});
-        } else {
-          // [修订 R2] Initial save failed but AI succeeded. Fallback retry
-          // with full data (original + optimized) as one complete record.
-          invoke("save_transcript_record", {
-            original: text,
-            optimized,
-            durationMs,
-            status: "done",
-          })
-            .then(() => setTranscriptRefreshKey((k) => k + 1))
-            .catch(() => {
-              console.error("Both initial and fallback saves failed");
-            });
         }
 
-        // Paste the optimized version
-        invoke("send_text_input", { text: optimized }).catch(() => {});
+        // Only auto-paste if this is still the current backend session.
+        // If the user already started a new session, silently drop the
+        // auto-paste — the optimized text is still in the history record,
+        // and typing it now would land in the wrong window.
+        if (backendGenerationRef.current === generation && !forcedAbortRef.current) {
+          invoke("send_text_input", { text: optimized }).catch(() => {});
+        } else {
+          appendLocalLog("info", "AI 优化完成但已有新会话开始，只更新历史记录");
+        }
       } catch (e) {
-        if (sessionIdRef.current !== currentSession || forcedAbortRef.current) return;
-
+        if (forcedAbortRef.current) return;
         playErrorSound();
         if (errorTimerRef.current !== null) window.clearTimeout(errorTimerRef.current);
         setHasError(true);
@@ -535,302 +428,274 @@ export default function App() {
             ? `AI 优化失败: ${e}，使用原始转写`
             : "AI 优化失败，使用原始转写",
         });
-
-        // AI failed — original text is already in history (status=partial).
-        // Just fall back to pasting the raw text.
-        invoke("send_text_input", { text }).catch(() => {});
+        appendLocalLog("warn", "AI 优化失败，已回退到原始转写");
+        // Fall back to pasting raw text (same guard: only if still current session)
+        if (backendGenerationRef.current === generation && !forcedAbortRef.current) {
+          invoke("send_text_input", { text: rawText }).catch(() => {});
+        }
       } finally {
-        if (sessionIdRef.current === currentSession && !forcedAbortRef.current) {
+        if (sessionIdRef.current === mySession) {
           setIsOptimizing(false);
           emitOverlayPhase("idle");
           closeOverlay();
-          invoke("mark_session_idle", { generation }).catch(() => {});
         }
       }
-    } else {
-      // Non-AI path: persisted in step 1 with status="done", just paste.
-      invoke("send_text_input", { text }).catch(() => {});
-      emitOverlayPhase("idle");
-      closeOverlay();
-      invoke("mark_session_idle", { generation }).catch(() => {});
-    }
-  }, [closeOverlay, emitOverlayPhase, emitOverlaySlow]);
+    },
+    [appendLocalLog, closeOverlay, emitOverlayPhase],
+  );
 
   useEffect(() => {
     const unlisteners: (() => void)[] = [];
     const listenerPromises = [
-      listen<string>("recording-cancelled", () => {
-        // Mistouch: mark so recording-status(false) skips post-recording flow
-        cancelledRef.current = true;
-      }),
-      listen<{ generation: number; reason: string }>("session-force-abort", (e) => {
-        // [Codex Check 6 fix] Filter stale aborts. abort releases the
-        // backend gate immediately, so a new session may already be
-        // running by the time this event arrives. Only act on aborts
-        // tagged with the current backend generation.
-        if (e.payload.generation !== backendGenerationRef.current) {
-          return;
-        }
-        handleForcedSessionAbort();
-      }),
-      listen<RecordingStatusPayload>("recording-status", (e) => {
-      const { recording, generation } = e.payload;
-      // Sync backend generation ref — ASR transcription-update events are
-      // filtered against this to discard stale-session packets.
-      backendGenerationRef.current = generation;
-      const wasRecording = isRecordingRef.current;
-      isRecordingRef.current = recording;
-      setIsRecording(recording);
-      if (recording) {
-        // ── [Fix B Rescue] Before wiping state: if the previous session
-        // ── ended but its text was never persisted (fallback timer cleared
-        // ── by this very handler OR AI optimize hung on the network),
-        // ── flush pending text to history as "partial". Persist-only,
-        // ── NO send_text_input — avoids ghost-typing old text into the
-        // ── user's current focused window (Codex caught this).
-        //
-        // CRITICAL: capture duration BEFORE resetting recordingStartTimeRef
-        // a few lines down.
-        const priorDurationMs = recordingStartTimeRef.current > 0
-          ? Date.now() - recordingStartTimeRef.current
-          : 0;
-        if (!persistedRef.current) {
-          const parts = [transcriptRef.current, interimTextRef.current]
-            .filter((s): s is string => typeof s === "string" && s.trim().length > 0);
-          if (parts.length > 0) {
-            const pending = parts.join("\n");
-            invoke<string>("save_transcript_record", {
-              original: pending,
-              optimized: null,
-              durationMs: priorDurationMs,
-              status: "partial",
-            })
-              .then(() => setTranscriptRefreshKey((k) => k + 1))
-              .catch((err) => {
-                if (err !== "empty_text") {
-                  console.error("Rescue save failed:", err);
-                }
-              });
-          }
-        }
-
-        // ── Now safe to reset all state ──────────────────────────────
-        setBanner(null);
-        setHasError(false);
-        errorHandledRef.current = false;
-        if (errorTimerRef.current !== null) {
-          window.clearTimeout(errorTimerRef.current);
-          errorTimerRef.current = null;
-        }
-        setTranscript("");
-        setInterimTextBoth("");
-        transcriptRef.current = "";
-        clearPostRecordingTimers();
-        textSentRef.current = false;
-        persistedRef.current = false; // new session starts unpersisted
-        currentRecordIdRef.current = null; // clear stale record id
-        cancelledRef.current = false;
-        forcedAbortRef.current = false;
-        sessionIdRef.current += 1;
-        setIsPostRecording(false);
-        setIsOptimizing(false);
-        setOptimizedText("");
-        recordingStartTimeRef.current = Date.now();
-        playStartSound();
-        if (settingsRef.current.show_overlay) showOverlay();
-        emitOverlayPhase("recording");
-      } else if (wasRecording) {
-        // If asr-error already handled cleanup, skip duplicate post-recording flow
-        if (errorHandledRef.current) {
-          errorHandledRef.current = false;
-          return;
-        }
-        // [修订 R3] Mistouch cancel — user explicitly discarded this session.
-        // Must clear all text state AND mark persisted=true to prevent the
-        // next new-session rescue block from saving the discarded text.
-        if (cancelledRef.current) {
-          cancelledRef.current = false;
+      // ── recording-cancelled ───────────────────────────────────────
+      // Fired when the user mistouches a hold-mode hotkey (<300ms) or
+      // presses ESC while recording. Just a UI hint — the authoritative
+      // end-of-session signal is still `session-ended`. We use this to
+      // hide the overlay a bit sooner on mistouch without waiting for
+      // the backend's wrap-up.
+      listen<string>("recording-cancelled", (e) => {
+        if (e.payload === "mistouch") {
+          // Mistouch: no speech expected, close the overlay fast.
+          // session-ended will still arrive (likely with status=no_speech)
+          // and will be a no-op when it does.
           setTranscript("");
           setInterimTextBoth("");
           transcriptRef.current = "";
-          setOptimizedText("");
-          persistedRef.current = true; // "handled" — rescue will skip
           emitOverlayPhase("idle");
           closeOverlay();
-          // Release the backend is_processing gate — the mistouch flow
-          // doesn't reach doAutoInput, so without this the backend would
-          // wait 65 seconds for the safety timeout.
-          invoke("mark_session_idle", { generation }).catch(() => {});
+        }
+      }),
+
+      // ── session-force-abort ───────────────────────────────────────
+      // Fired when the user presses ESC. Backend has already set the
+      // aborted flag, so the ASR task will produce a
+      // session-ended { status: "aborted" } shortly. We set the
+      // forcedAbortRef to suppress any in-flight AI optimize output.
+      listen<{ generation: number; reason: string }>("session-force-abort", (e) => {
+        if (e.payload.generation !== backendGenerationRef.current) return;
+        forcedAbortRef.current = true;
+        appendLocalLog("info", "已中止当前会话，保留已有转写");
+      }),
+
+      // ── recording-status ──────────────────────────────────────────
+      // Start/stop markers for the waveform UI. Source of truth for
+      // "am I recording right now" in the UI, but NOT for "is the
+      // session done" (that's session-ended).
+      listen<RecordingStatusPayload>("recording-status", (e) => {
+        const { recording, generation } = e.payload;
+        // Stale session-stop: when the user rapidly restarts, the old
+        // ASR task's wrap-up may emit recording-status(false, N) after
+        // a new session N+1 is already active. Drop it so we don't
+        // flip the UI back to "not recording" during the new session.
+        if (generation < backendGenerationRef.current) return;
+        if (generation > backendGenerationRef.current) {
+          backendGenerationRef.current = generation;
+        }
+        const wasRecording = isRecordingRef.current;
+        isRecordingRef.current = recording;
+        setIsRecording(recording);
+
+        if (recording) {
+          // ── New session ─────────────────────────────────────────
+          setBanner(null);
+          setHasError(false);
+          if (errorTimerRef.current !== null) {
+            window.clearTimeout(errorTimerRef.current);
+            errorTimerRef.current = null;
+          }
+          setTranscript("");
+          setInterimTextBoth("");
+          transcriptRef.current = "";
+          clearSlowHintTimer();
+          forcedAbortRef.current = false;
+          sessionIdRef.current += 1;
+          setIsPostRecording(false);
+          setIsOptimizing(false);
+          setOptimizedText("");
+          setIsConnected(false);
+          recordingStartTimeRef.current = Date.now();
+          playStartSound();
+          if (settingsRef.current.show_overlay) showOverlay();
+          emitOverlayPhase("recording");
+        } else if (wasRecording) {
+          // ── Backend stopped recording; now waiting for session-ended ──
+          //
+          // Skip the "processing" UI flash if this session was aborted —
+          // session-ended will arrive shortly with status="aborted" and
+          // close the overlay, no point showing a processing indicator
+          // for a cancelled session.
+          if (forcedAbortRef.current) {
+            setIsPostRecording(false);
+            return;
+          }
+          // Fast-path: if VAD never observed speech (mistouch hold, silence
+          // timeout, no-speech session), there is no ASR result coming
+          // worth waiting for. Skip the processing UI and let session-ended
+          // (status=no_speech) silently close a moment later.
+          if (e.payload.had_speech === false) {
+            setIsPostRecording(false);
+            return;
+          }
+          playStopSound();
+          setIsPostRecording(true);
+          emitOverlayPhase("processing");
+          // Start the slow-hint timer (UX: reassure the user that
+          // something is still happening if session-ended takes > 3s).
+          if (slowHintTimerRef.current !== null) {
+            window.clearTimeout(slowHintTimerRef.current);
+          }
+          slowHintTimerRef.current = window.setTimeout(() => {
+            slowHintTimerRef.current = null;
+            setIsProcessingSlow(true);
+            emitOverlaySlow(true);
+            appendLocalLog("info", "识别等待时间较长，继续处理中");
+          }, SLOW_HINT_MS);
+        }
+      }),
+
+      // ── transcription-update (live interim rendering only) ────────
+      // Used purely for UI feedback during recording and the brief
+      // post-recording window. The authoritative text comes from
+      // session-ended — this event is just a faster visual preview.
+      listen<TranscriptPayload>("transcription-update", (e) => {
+        const gen = e.payload.generation;
+        // Self-heal: transcription-update may arrive before recording-status
+        if (gen < backendGenerationRef.current) return;
+        if (gen > backendGenerationRef.current) {
+          backendGenerationRef.current = gen;
+        }
+        if (forcedAbortRef.current) return;
+        const data = e.payload;
+        if (data.is_final) {
+          setTranscript((prev) => {
+            const next = (prev ? prev + "\n" : "") + data.text;
+            transcriptRef.current = next;
+            return next;
+          });
+          setInterimTextBoth("");
+        } else {
+          setInterimTextBoth(data.text);
+        }
+      }),
+
+      // ── session-ended: the single end-of-session truth ────────────
+      listen<SessionEndedPayload>("session-ended", (e) => {
+        const {
+          generation,
+          final_text,
+          status,
+          error_reason,
+          error_detail,
+          duration_ms,
+          record_id,
+        } = e.payload;
+
+        // Stale session-ended (belongs to a session older than the current one):
+        // still update history stats if needed, but don't touch UI.
+        if (generation < backendGenerationRef.current) {
+          if (record_id) setTranscriptRefreshKey((k) => k + 1);
           return;
         }
-        playStopSound();
-        setIsPostRecording(true);
-        emitOverlayPhase("processing");
-        // Capture the generation of the session that just stopped — thread
-        // it through every deferred callback below so any late call to
-        // `mark_session_idle` is tagged with THIS session's gen, not
-        // whatever the ref happens to hold when the callback fires.
-        // Without this, a late call could wrongly clear the gate of a
-        // later session that happens to be in its own processing window.
-        const sessionGeneration = generation;
-
-        // ── [Batch 2] Phased post-recording timers ────────────────────
-        // Two timers replace the old single 2s fallback:
-        //
-        //   3s  → soft hint: UI switches "识别中" → "正在努力识别中"
-        //         so the user sees the app is still working on a slow
-        //         network, instead of wondering if it died.
-        //   6s  → force advance: promote interim → transcript and run
-        //         doAutoInput, same fallback logic as the old 2s timer.
-        //         By this point whatever Doubao gave us in first-pass
-        //         is already persisted by doAutoInput Step 1, so even
-        //         if FINAL never arrives the content is safe.
-        //
-        // The 6s must be LESS than the ASR provider's own internal
-        // timeout (doubao/dashscope/qwen all ~10s) so the frontend
-        // force-advances before the backend gives up — avoids double
-        // error paths racing.
-        const SLOW_HINT_MS = 3000;
-        const FORCE_ADVANCE_MS = 6000;
-
-        slowHintTimerRef.current = window.setTimeout(() => {
-          slowHintTimerRef.current = null;
-          if (textSentRef.current) return; // FINAL already handled it
-          setIsProcessingSlow(true);
-          emitOverlaySlow(true);
-        }, SLOW_HINT_MS);
-
-        // Don't hide overlay yet — keep showing during ASR processing / AI optimization
-        // Recording stopped — wait for FINAL from ASR before auto-inputting.
-        // The ASR sends a FINAL event after the end packet (typically 0.5-1.5s).
-        // If FINAL arrives, the transcription-update handler will trigger auto-input.
-        // Fallback: if FINAL doesn't arrive within 6s, promote interim and send.
-        autoInputTimerRef.current = window.setTimeout(() => {
-          autoInputTimerRef.current = null;
-          if (textSentRef.current) return; // FINAL already handled it
-          // Promote interim → transcript (both state and ref stay in sync)
-          const pending = interimTextRef.current;
-          if (pending) {
-            setTranscript((t) => {
-              const next = (t ? t + "\n" : "") + pending;
-              transcriptRef.current = next;
-              return next;
-            });
-            setInterimTextBoth("");
-          }
-          setTimeout(() => {
-            if (textSentRef.current) return;
-            const text = transcriptRef.current;
-            if (text) {
-              doAutoInput(text, sessionGeneration);
-            } else {
-              // No text at all (e.g. stop pressed before any speech detected).
-              // Must release the backend is_processing gate here — doAutoInput
-              // is the only other place that calls mark_session_idle, and
-              // we're skipping it. Without this, is_processing stays true
-              // until the 65s safety timeout, causing "session busy" rejects
-              // on every new hotkey press during that window.
-              setIsProcessingSlow(false);
-              emitOverlaySlow(false);
-              emitOverlayPhase("idle");
-              closeOverlay();
-              invoke("mark_session_idle", {
-                generation: sessionGeneration,
-              }).catch(() => {});
-            }
-          }, 100);
-        }, FORCE_ADVANCE_MS);
-      }
-      }),
-
-      listen<TranscriptPayload>("transcription-update", (e) => {
-      // [修订 R4] Self-healing generation filter.
-      // Tauri cross-thread emit doesn't guarantee strict ordering —
-      // transcription-update may arrive before the recording-status event
-      // that would have updated backendGenerationRef. So:
-      //   - gen < current : stale-session late arrival → drop
-      //   - gen > current : recording-status hasn't arrived yet → self-heal
-      //   - gen == current : normal, accept
-      const gen = e.payload.generation;
-      if (gen < backendGenerationRef.current) return;
-      if (gen > backendGenerationRef.current) {
-        backendGenerationRef.current = gen;
-      }
-
-      if (forcedAbortRef.current) return;
-      const data = e.payload;
-      if (data.is_final) {
-        setTranscript((prev) => {
-          const next = (prev ? prev + "\n" : "") + data.text;
-          transcriptRef.current = next;
-          return next;
-        });
-        setInterimTextBoth("");
-
-        // If recording already stopped, cancel fallback timer and send text now
-        if (!isRecordingRef.current && !textSentRef.current) {
-          // FINAL arrived — cancel BOTH the soft-hint timer and the
-          // force-advance timer, and reset the slow-hint state if it
-          // had already fired before FINAL came in.
-          clearPostRecordingTimers();
-          // Use the generation from THIS event payload — that's the
-          // session that produced this FINAL, regardless of what
-          // backendGenerationRef has drifted to since.
-          const finalGen = gen;
-          setTimeout(() => {
-            const text = transcriptRef.current;
-            if (text) {
-              doAutoInput(text, finalGen);
-            } else {
-              // FINAL arrived but with empty text — same release-the-gate
-              // requirement as the timer fallback below: doAutoInput is
-              // skipped, so we must call mark_session_idle ourselves or
-              // is_processing stays true until the 65s safety timeout.
-              emitOverlayPhase("idle");
-              closeOverlay();
-              invoke("mark_session_idle", { generation: finalGen }).catch(() => {});
-            }
-          }, 100);
+        if (generation > backendGenerationRef.current) {
+          backendGenerationRef.current = generation;
         }
-      } else {
-        setInterimTextBoth(data.text);
-      }
-      }),
 
-      listen<string>("asr-error", (e) => {
-        if (forcedAbortRef.current) return;
-        errorHandledRef.current = true; // Prevent duplicate post-recording from recording-status(false)
-        playErrorSound();
-        if (errorTimerRef.current !== null) window.clearTimeout(errorTimerRef.current);
-        setHasError(true);
-        errorTimerRef.current = window.setTimeout(() => {
-          setHasError(false);
-          errorTimerRef.current = null;
-        }, 3000);
-        const errorText = settingsRef.current.debug_mode
-          ? e.payload
-          : simplifyError(e.payload);
-        setBanner({ kind: "error", text: errorText });
-        // Mark persisted=true so any pending text from this failed session
-        // isn't rescue-saved on the next recording attempt.
-        persistedRef.current = true;
-        // Clear 3s/6s post-recording timers in case error fired after stop.
-        clearPostRecordingTimers();
-        emitOverlayPhase("idle");
-        closeOverlay();
-        // Release the backend is_processing gate in case stop was called
-        // before the error fired (do_stop_recording_impl would have set it).
-        invoke("mark_session_idle", {
-          generation: backendGenerationRef.current,
-        }).catch(() => {});
-      }),
+        // Clear the post-recording wait state
+        clearSlowHintTimer();
+        setIsPostRecording(false);
+        setIsConnected(false);
+        if (record_id) setTranscriptRefreshKey((k) => k + 1);
 
-      // Backend rejected a start-recording attempt because a previous
-      // session is still wrapping up (is_processing=true). Show a brief toast.
-      // showToast already replaces any currently-visible toast, so rapid
-      // repeated rejections just refresh the same single toast — no stacking.
-      listen<string>("session-busy", (e) => {
-        showToast(e.payload);
+        // Update usage stats on successful sessions with text
+        if (status === "ok" && final_text && duration_ms > 0) {
+          invoke("update_usage_stats", {
+            sessionDurationMs: duration_ms,
+            text: final_text,
+          }).catch(() => {});
+        }
+
+        switch (status) {
+          case "ok": {
+            // Replace any interim text with the authoritative final
+            setTranscript(final_text);
+            transcriptRef.current = final_text;
+            setInterimTextBoth("");
+
+            if (forcedAbortRef.current) {
+              emitOverlayPhase("idle");
+              closeOverlay();
+              return;
+            }
+
+            if (settingsRef.current.ai_optimize.enabled) {
+              runAiOptimize(final_text, record_id ?? null, generation);
+            } else {
+              invoke("send_text_input", { text: final_text }).catch(() => {});
+              emitOverlayPhase("idle");
+              closeOverlay();
+            }
+            break;
+          }
+
+          case "no_speech": {
+            // Silent close — no banner, no sound.
+            setTranscript("");
+            setInterimTextBoth("");
+            transcriptRef.current = "";
+            emitOverlayPhase("idle");
+            closeOverlay();
+            break;
+          }
+
+          case "aborted": {
+            // User-initiated abort. The backend already persisted any
+            // accumulated finals as an aborted record. Show the text on
+            // screen briefly so the user knows what was kept.
+            setTranscript(final_text);
+            transcriptRef.current = final_text;
+            setInterimTextBoth("");
+            appendLocalLog("info", final_text ? "会话已中止，保留已识别文本" : "会话已中止");
+            emitOverlayPhase("idle");
+            closeOverlay();
+            break;
+          }
+
+          case "error": {
+            // Red waveform + error sound + banner. Show whatever finals
+            // the backend accumulated before the error — they're already
+            // persisted as a "partial" record.
+            const reason = error_reason ?? "语音识别出错";
+            const detail = error_detail ?? reason;
+            const displayText = settingsRef.current.debug_mode ? detail : reason;
+            setBanner({ kind: "error", text: displayText });
+            appendLocalLog("error", `语音识别失败：${reason}`);
+            playErrorSound();
+            if (errorTimerRef.current !== null) window.clearTimeout(errorTimerRef.current);
+            setHasError(true);
+            errorTimerRef.current = window.setTimeout(() => {
+              setHasError(false);
+              errorTimerRef.current = null;
+            }, 3000);
+            // Show any partial text so the user can see what was preserved
+            setTranscript(final_text);
+            transcriptRef.current = final_text;
+            setInterimTextBoth("");
+            // Flash the red error phase on the overlay before closing.
+            //
+            // Session-guard: capture the current sessionId and only close
+            // the overlay if we're still in the same session when the timer
+            // fires. Otherwise a new session started within the 2.2s flash
+            // window would have its overlay closed by this stale timer.
+            emitOverlayPhase("error");
+            const errorSessionId = sessionIdRef.current;
+            window.setTimeout(() => {
+              if (sessionIdRef.current !== errorSessionId) return;
+              emitOverlayPhase("idle");
+              closeOverlay();
+            }, ERROR_FLASH_MS);
+            break;
+          }
+        }
       }),
 
       listen<string>("settings-warning", (e) => {
@@ -850,8 +715,7 @@ export default function App() {
 
       listen<string>("network-log", (e) => {
         try {
-          const entry: LogEntry = JSON.parse(e.payload);
-          setLogs((prev) => [...prev.slice(-200), entry]);
+          appendLogEntry(JSON.parse(e.payload) as LogEntry);
         } catch {}
       }),
 
@@ -864,6 +728,10 @@ export default function App() {
       listen("show-about", () => {
         setAboutOpen(true);
       }),
+      listen("show-stats", () => {
+        setSettingsInitialTab("stats");
+        setSettingsOpen(true);
+      }),
     ];
 
     Promise.all(listenerPromises).then((fns) => {
@@ -872,11 +740,22 @@ export default function App() {
     });
 
     return () => { unlisteners.forEach((fn) => fn()); };
-  }, [closeOverlay, doAutoInput, emitOverlayPhase, handleForcedSessionAbort, setInterimTextBoth, showToast]);
+  }, [
+    appendLocalLog,
+    appendLogEntry,
+    clearSlowHintTimer,
+    closeOverlay,
+    emitOverlayPhase,
+    emitOverlaySlow,
+    runAiOptimize,
+    setInterimTextBoth,
+  ]);
 
   const handleToggleRecording = useCallback(async () => {
-    // Ignore if ASR/AI processing is in progress (prevent rapid re-triggering)
-    if (!isRecording && (isPostRecording || isOptimizing)) return;
+    // NOTE: no gate against isPostRecording/isOptimizing — the whole
+    // point of the 2026-04 refactor is that any session's post-processing
+    // (waiting for session-ended, AI optimize, text output) never blocks
+    // a new recording. The user's flow trumps any in-flight work.
     try {
       setBanner(null);
       if (isRecording) {
@@ -907,17 +786,17 @@ export default function App() {
     } catch (e) {
       setBanner({ kind: "error", text: String(e) });
     }
-  }, [isRecording, isPostRecording, isOptimizing, settings]);
-
-  // Pending settings: saved to backend immediately, but App state deferred
-  // until panel closes to avoid re-render flash behind backdrop-blur.
-  const pendingSettingsRef = useRef<AppSettings | null>(null);
+  }, [isRecording, settings]);
 
   const handleSaveSettings = useCallback(async (newSettings: AppSettings) => {
     try {
       setBanner(null);
       const savedSettings = await invoke<AppSettings>("save_settings", { settings: newSettings });
       pendingSettingsRef.current = savedSettings;
+      // Sync settingsRef immediately so in-flight recordings see the new value
+      // (setSettings is deferred until panel close to avoid re-render flash)
+      settingsRef.current = savedSettings;
+      invoke("rebuild_tray_menu_cmd").catch(() => {});
       return savedSettings;
     } catch (e) {
       const message = String(e);
@@ -1071,6 +950,7 @@ export default function App() {
         e.preventDefault();
         e.stopPropagation();
         if (!e.repeat) {
+          appendLocalLog("info", "窗口内 ESC：请求中止当前会话");
           invoke("abort_current_session").catch(() => {});
         }
         return;
@@ -1084,9 +964,11 @@ export default function App() {
         if (!isRecordingRef.current) {
           jsHoldActive = true;
           jsHoldStartTime = Date.now();
+          appendLocalLog("info", "窗口内热键按下：请求开始录音");
           handleToggleRecording();
         }
       } else {
+        appendLocalLog("info", isRecordingRef.current ? "窗口内热键：请求结束录音" : "窗口内热键：请求开始录音");
         handleToggleRecording();
       }
     };
@@ -1105,8 +987,15 @@ export default function App() {
       // Use jsHoldActive (now false) as the primary guard instead of isRecordingRef,
       // because recording-status(true) may not have arrived yet via async IPC.
       // handleToggleRecording → invoke("stop_recording") is idempotent (is_recording guard).
+      //
+      // Mistouch handling: a <300ms hold rarely captures any speech (VAD
+      // needs multiple consecutive speech frames), so the backend's
+      // session-ended will come back with status="no_speech" and the
+      // UI closes silently. No special flag needed.
       if (Date.now() - jsHoldStartTime < MIN_HOLD_MS) {
-        cancelledRef.current = true;
+        appendLocalLog("info", "窗口内热键释放：判定为误触，取消本次录音");
+      } else {
+        appendLocalLog("info", "窗口内热键释放：请求结束录音");
       }
       handleToggleRecording();
     };
@@ -1119,7 +1008,9 @@ export default function App() {
       if (jsHoldActive) {
         jsHoldActive = false;
         if (Date.now() - jsHoldStartTime < MIN_HOLD_MS) {
-          cancelledRef.current = true;
+          appendLocalLog("info", "窗口失焦：判定为误触，取消本次录音");
+        } else {
+          appendLocalLog("info", "窗口失焦：请求结束录音");
         }
         handleToggleRecording();
       }
@@ -1133,7 +1024,7 @@ export default function App() {
       window.removeEventListener("keyup", onKeyUp, true);
       window.removeEventListener("blur", onBlur);
     };
-  }, [handleToggleRecording]);
+  }, [appendLocalLog, handleToggleRecording, isOptimizing, isPostRecording, isRecording]);
 
   return (
     <div className={cn(
@@ -1394,7 +1285,7 @@ export default function App() {
                 className="pointer-events-auto w-full max-w-[calc(100%-1rem)] h-[85vh] bg-surface-card border border-edge rounded-2xl shadow-2xl overflow-hidden flex flex-col"
                 onClick={(e) => e.stopPropagation()}
               >
-                <Settings settings={settings} onSave={handleSaveSettings} onClose={handleCloseSettings} initialTab={settingsInitialTab} />
+                <Settings settings={settings} onSave={handleSaveSettings} onClose={handleCloseSettings} initialTab={settingsInitialTab} isRecording={isRecording} />
               </div>
             </motion.div>
           </>

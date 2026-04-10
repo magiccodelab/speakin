@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "SpeakIn",
-  "version": "1.0.0",
-  "identifier": "com.speakin.app",
+  "version": "1.0.8",
+  "identifier": "com.magiccodelab.speakin",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,14 +13,16 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "SpeakIn",
+        "title": "SpeakIn 声入",
         "width": 420,
         "height": 660,
         "minWidth": 360,
         "minHeight": 500,
         "center": true,
         "decorations": false,
-        "resizable": true
+        "resizable": true,
+        "visible": false,
+        "backgroundColor": "#171a21"
       }
     ],
     "security": {
@@ -29,7 +31,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis"],
     "publisher": "magiccodelab",
     "copyright": "Copyright © 2026 magiccodelab. Licensed under GPL-3.0.",
     "category": "Productivity",
@@ -51,7 +53,8 @@
       "nsis": {
         "languages": ["SimpChinese", "English"],
         "displayLanguageSelector": true,
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "installerHooks": "./windows/hooks.nsh"
       }
     }
   }

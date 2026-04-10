@@ -1,7 +1,7 @@
 [package]
 name = "speakin"
-version = "1.0.0"
-description = "SpeakIn 声入 - 全局热键语音输入工具，支持豆包/百炼/千问 ASR 与 AI 优化"
+version = "1.0.8"
+description = "SpeakIn声入 - 全局热键语音输入工具，支持豆包/百炼/千问 ASR 与 AI 优化"
 authors = ["magiccodelab", "afengblog"]
 license = "GPL-3.0"
 edition = "2021"
@@ -40,8 +40,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Foundation",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
+    "Win32_System_Time",
 ] }
 windows = { version = "0.58", features = [
     "Win32_Media_Audio",
@@ -50,6 +52,7 @@ windows = { version = "0.58", features = [
 tauri-plugin-autostart = "2"
 base64 = "0.22"
 reqwest = { version = "0.12", features = ["json", "stream", "native-tls"] }
+tauri-plugin-single-instance = "2"
 
 [profile.release]
 lto = true

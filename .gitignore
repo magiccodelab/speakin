@@ -10,6 +10,12 @@ src-tauri/target/
 
 # Environment (contains API keys)
 .env
+.env.*
+!.env.example
+
+# Local AI/editor tool settings
+/.claude/
+/.codex/
 
 # Logs
 logs/
@@ -22,6 +28,12 @@ lerna-debug.log*
 
 # Local overrides
 *.local
+
+# Test / cache
+coverage/
+.nyc_output/
+*.tsbuildinfo
+.vite/
 
 # Editor directories and files
 .vscode/*

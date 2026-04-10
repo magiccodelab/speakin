@@ -32,7 +32,14 @@
       "Bash(pnpm tsc:*)",
       "Bash(python3 -c ':*)",
       "Bash(powershell -Command ':*)",
-      "Bash(pnpm exec:*)"
+      "Bash(pnpm exec:*)",
+      "Read(//tmp/**)",
+      "Bash(pnpm build:*)",
+      "Bash(start src-tauri/icons/icon.svg)",
+      "Bash(gh auth:*)",
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" auth status)",
+      "Bash(\"/c/Program Files \\(x86\\)/GitHub CLI/gh.exe\" auth status)",
+      "Bash(git remote:*)"
     ]
   }
 }

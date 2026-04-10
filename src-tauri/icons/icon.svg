@@ -1,10 +1,42 @@
 <svg viewBox="0 0 512 512" width="512" height="512" xmlns="http://www.w3.org/2000/svg">
-<rect width="512" height="512" fill="#F8FAFC"/>
-<rect x="218" y="128" width="76" height="136" rx="38" fill="#2563EB"/>
-<path d="M176 264c0 44.2 35.8 80 80 80s80-35.8 80-80" fill="none" stroke="#2563EB" stroke-width="20" stroke-linecap="round"/>
-<line x1="256" y1="344" x2="256" y2="378" stroke="#2563EB" stroke-width="20" stroke-linecap="round"/>
-<line x1="230" y1="378" x2="282" y2="378" stroke="#2563EB" stroke-width="20" stroke-linecap="round"/>
-<rect x="310" y="180" width="5.5" height="60" rx="2.75" fill="#60A5FA"/>
-<path d="M152 214c-12-18-12-46 0-64" fill="none" stroke="#93C5FD" stroke-width="10" stroke-linecap="round"/>
-<path d="M124 228c-22-32-22-80 0-112" fill="none" stroke="#BFDBFE" stroke-width="10" stroke-linecap="round"/>
+  <defs>
+    <linearGradient id="mic-grad" x1="218" y1="128" x2="294" y2="378" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3B82F6"/>
+      <stop offset="100%" stop-color="#1D4ED8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background: clean rounded rectangle, no filter glow -->
+  <rect x="24" y="24" width="464" height="464" rx="96" ry="96" fill="#F1F5F9"/>
+  <!-- Inner highlight layer for subtle raised feel -->
+  <rect x="28" y="28" width="456" height="456" rx="92" ry="92" fill="#F8FAFC" opacity="0.9"/>
+
+  <!-- Soft blue glow behind mic group -->
+  <circle cx="256" cy="248" r="60" fill="#3B82F6" opacity="0.08"/>
+
+  <!-- Mic body (capsule) with gradient -->
+  <rect x="218" y="128" width="76" height="136" rx="38" fill="url(#mic-grad)"/>
+  <!-- Mic body specular highlight -->
+  <rect x="232" y="138" width="20" height="80" rx="10" fill="#FFFFFF" opacity="0.18"/>
+
+  <!-- Mic stand arc -->
+  <path d="M176 264c0 44.2 35.8 80 80 80s80-35.8 80-80"
+        fill="none" stroke="url(#mic-grad)" stroke-width="20" stroke-linecap="round"/>
+
+  <!-- Vertical stem -->
+  <line x1="256" y1="344" x2="256" y2="378"
+        stroke="url(#mic-grad)" stroke-width="20" stroke-linecap="round"/>
+
+  <!-- Base bar -->
+  <line x1="230" y1="378" x2="282" y2="378"
+        stroke="url(#mic-grad)" stroke-width="20" stroke-linecap="round"/>
+
+  <!-- Sound indicator bar (right side) -->
+  <rect x="310" y="180" width="5.5" height="60" rx="2.75" fill="#60A5FA" opacity="0.7"/>
+
+  <!-- Sound wave arcs (left side) -->
+  <path d="M152 214c-12-18-12-46 0-64"
+        fill="none" stroke="#93C5FD" stroke-width="10" stroke-linecap="round" opacity="0.5"/>
+  <path d="M124 228c-22-32-22-80 0-112"
+        fill="none" stroke="#BFDBFE" stroke-width="10" stroke-linecap="round" opacity="0.35"/>
 </svg>

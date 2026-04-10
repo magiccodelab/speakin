@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>SpeakIn</title>
+    <title>SpeakIn 声入</title>
     <!-- Prevent dark-mode & theme-color flash: apply BEFORE any rendering -->
     <script>
       (function() {
@@ -20,11 +20,13 @@
         }
         // Theme color: read cached HSL values (source of truth is theme-colors.ts)
         var id = localStorage.getItem('theme-color-id');
-        if (id && id !== 'blue') {
+        if (id) {
           var isDark = document.documentElement.classList.contains('dark');
           var hsl = localStorage.getItem(isDark ? 'theme-color-dark' : 'theme-color-light');
           if (hsl) {
-            document.documentElement.style.setProperty('--primary', hsl);
+            if (id !== 'blue') {
+              document.documentElement.style.setProperty('--primary', hsl);
+            }
             if (localStorage.getItem('theme-recording-follows') === '1') {
               document.documentElement.style.setProperty('--recording', hsl);
               document.documentElement.style.setProperty('--recording-pulse', hsl);

@@ -40,7 +40,7 @@ export function TitleBar({ children, onClose }: TitleBarProps) {
           <path d="M152 214c-12-18-12-46 0-64" fill="none" className="stroke-primary opacity-40" strokeWidth="10" strokeLinecap="round" />
           <path d="M124 228c-22-32-22-80 0-112" fill="none" className="stroke-primary opacity-25" strokeWidth="10" strokeLinecap="round" />
         </svg>
-        <h1 className="text-xs font-semibold text-fg tracking-tight">SpeakIn</h1>
+        <h1 className="text-xs font-semibold text-fg tracking-tight">SpeakIn声入</h1>
       </div>
 
       {/* Spacer: fills empty area, acts as drag region */}

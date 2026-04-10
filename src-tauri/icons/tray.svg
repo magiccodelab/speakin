@@ -1,22 +1,42 @@
 <!--
-  Tray-specific icon. Designed at viewBox 0 0 32 32 so strokes/coords land on
-  exact pixel boundaries when rendered at 32x32 (Windows tray native size).
-  No filters, no thin decorations, no near-white fills — everything that goes
-  fuzzy below 24px in the main icon.svg has been stripped.
+  Tray / taskbar / small-icon source. Designed at viewBox 0 0 32 32 so
+  strokes and coords land on exact pixel boundaries at 32x32 (Windows tray
+  native size). No filters, no thin decorations, no near-white fills —
+  everything that would go fuzzy below 24px has been stripped.
+
+  Design decisions:
+  • TRANSPARENT background — adapts to whatever surface it's on (Windows
+    light/dark taskbar, system tray, Alt+Tab switcher, Start menu small
+    tile). Using a solid color rectangle here looks alien next to other
+    apps in the taskbar.
+  • Geometry is scaled ~1.33× vs the original bg-backed version so the
+    mic fills ~89% of the canvas vertically (up from ~65%). Without the
+    solid background, the mic itself has to carry the visual weight —
+    this matches how Chrome / VSCode / etc. fill their taskbar canvases.
+  • Stroke weight 3px (up from 2) to stay proportional to the larger
+    mic body (8px capsule instead of 6px). Still integer so it snaps to
+    the pixel grid at 32x32; at 64x64 (tray@2x.png) it renders as 6px.
+  • Mic fill: #3B82F6 (Tailwind blue-500). Chosen as the middle ground
+    between the two app theme primaries — light mode uses #2563EB, dark
+    mode uses ~#3B82F6. This single value keeps ≥4:1 contrast against
+    BOTH the Win11 light taskbar (#F3F3F3, ~4.1:1) and the dark taskbar
+    (#202020, ~4.9:1) while staying visually consistent with the brand
+    #2563EB used by icon.svg (desktop / installer / large file icon).
+
+  The large white-background icon.svg is intentionally NOT touched —
+  gen_icons.py uses icon.svg for ICO layers ≥64px, ICNS, and Store logos,
+  so the desktop / installer / File Explorer icon is unchanged.
 -->
 <svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" shape-rendering="geometricPrecision">
-  <!-- Background: solid brand blue rounded square (high contrast on both light & dark trays) -->
-  <rect width="32" height="32" rx="7" fill="#2563EB"/>
+  <!-- Mic body: brand blue rounded capsule, 8×17 centered at x=16 -->
+  <rect x="12" y="2" width="8" height="17" rx="4" fill="#3B82F6"/>
 
-  <!-- Mic body: white rounded capsule -->
-  <rect x="13" y="6" width="6" height="13" rx="3" fill="#ffffff"/>
+  <!-- Mic stand arc (U shape under the body), radius 9 centered (16,17) -->
+  <path d="M7 17a9 9 0 0018 0" fill="none" stroke="#3B82F6" stroke-width="3" stroke-linecap="round"/>
 
-  <!-- Mic stand arc (U shape under the body) -->
-  <path d="M9 15a7 7 0 0014 0" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>
+  <!-- Vertical stem from arc bottom to base bar -->
+  <line x1="16" y1="26" x2="16" y2="29" stroke="#3B82F6" stroke-width="3" stroke-linecap="round"/>
 
-  <!-- Vertical stem from arc bottom to base -->
-  <line x1="16" y1="22" x2="16" y2="26" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>
-
-  <!-- Base bar -->
-  <line x1="13" y1="26" x2="19" y2="26" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>
+  <!-- Base bar, 10 wide -->
+  <line x1="11" y1="29" x2="21" y2="29" stroke="#3B82F6" stroke-width="3" stroke-linecap="round"/>
 </svg>

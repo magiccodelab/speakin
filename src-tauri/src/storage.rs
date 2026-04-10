@@ -7,7 +7,7 @@ use tauri_plugin_store::StoreExt;
 
 const STORE_FILENAME: &str = "settings.json";
 const STATS_FILENAME: &str = "stats.json";
-pub(crate) const KEYRING_SERVICE: &str = "com.speakin.app";
+pub(crate) const KEYRING_SERVICE: &str = "com.magiccodelab.speakin";
 
 // ── Generic store helpers ──
 
@@ -293,6 +293,18 @@ fn load_settings_legacy(app: &AppHandle) -> AppSettings {
     {
         settings.esc_abort_enabled = v;
     }
+    if let Some(v) = store
+        .get("silence_auto_stop_secs")
+        .and_then(|v| v.as_u64())
+    {
+        settings.silence_auto_stop_secs = v.clamp(3, 60) as u8;
+    }
+    if let Some(v) = store
+        .get("vad_sensitivity")
+        .and_then(|v| v.as_u64())
+    {
+        settings.vad_sensitivity = v.clamp(1, 10) as u8;
+    }
     // DashScope
     if let Some(v) = store
         .get("dashscope_model")
@@ -420,7 +432,7 @@ fn load_usage_stats_legacy(app: &AppHandle) -> UsageStats {
 // ── Recent Transcript Records ──
 
 const TRANSCRIPTS_FILENAME: &str = "recent_transcripts.json";
-const MAX_RECORDS: usize = 10;
+const MAX_RECORDS: usize = 30;
 const EXPIRE_MS: u64 = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 fn now_ms() -> u64 {
@@ -512,38 +524,6 @@ pub fn update_transcript_optimized_by_id(
     Ok(())
 }
 
-/// Update an existing record's `status` field. Used by ESC abort during
-/// AI optimize phase: the record was already persisted with status="partial"
-/// during doAutoInput Step 1, but the user explicitly aborted, so the
-/// correct semantic is "aborted". See Codex Check 7a.
-///
-/// Returns Err if no record with the given id exists.
-pub fn update_transcript_status_by_id(
-    app: &AppHandle,
-    id: &str,
-    status: String,
-) -> Result<(), String> {
-    let store = app
-        .store(TRANSCRIPTS_FILENAME)
-        .map_err(|e| format!("打开转录记录存储失败: {}", e))?;
-
-    let mut records: Vec<TranscriptRecord> = store
-        .get("records")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-
-    let Some(record) = records.iter_mut().find(|r| r.id == id) else {
-        return Err(format!("record not found: {}", id));
-    };
-    record.status = status;
-
-    store.set("records", serde_json::json!(&records));
-    store
-        .save()
-        .map_err(|e| format!("转录记录落盘失败: {}", e))?;
-    Ok(())
-}
-
 pub fn clear_transcript_records(app: &AppHandle) -> Result<(), String> {
     let store = app
         .store(TRANSCRIPTS_FILENAME)
@@ -577,4 +557,98 @@ pub(crate) fn save_credential(key: &str, value: &str) -> Result<(), String> {
             .map_err(|e| format!("保存凭据失败: {}", e))?;
     }
     Ok(())
+}
+
+// ── Uninstall cleanup ──
+
+/// Fixed credential keys this app writes to the OS keyring. Mirrors the
+/// `save_credential` call sites in `save_settings` — keep in sync.
+const FIXED_CREDENTIAL_KEYS: &[&str] = &[
+    "app_id",
+    "access_token",
+    "dashscope_api_key",
+    "qwen_api_key",
+];
+
+/// Best-effort removal of EVERY credential this app has ever written to the
+/// OS keyring. Invoked via the hidden `--uninstall-cleanup` CLI flag from
+/// the NSIS uninstaller's PreUninstall hook only after the user checks
+/// "delete app data", BEFORE installed files are removed (so the binary is
+/// still present to run).
+///
+/// ## Safety contract
+///
+/// This function uses the SAME `keyring::Entry::new(service, key)` API that
+/// wrote each credential, with the SAME `KEYRING_SERVICE` constant. This
+/// makes it mathematically impossible to delete any credential that does
+/// not belong to this application — no wildcards, no pattern matching, no
+/// enumeration of the Credential Manager.
+///
+/// Keys deleted:
+/// - `FIXED_CREDENTIAL_KEYS` — hardcoded list of ASR provider keys
+/// - `ai_provider_<id>` — dynamic per-provider keys, with `<id>` values read
+///   directly from our own `ai_providers.json` file in the app data dir
+///
+/// All errors (including `NoEntry`) are swallowed. Uninstall must never
+/// fail because of cleanup; the worst case is a stray credential left in
+/// Credential Manager, which is the status quo without this function.
+#[cfg(windows)]
+pub fn uninstall_cleanup() {
+    for key in FIXED_CREDENTIAL_KEYS {
+        delete_credential_best_effort(key);
+    }
+    for id in enumerate_ai_provider_ids_for_cleanup() {
+        delete_credential_best_effort(&format!("ai_provider_{}", id));
+    }
+}
+
+#[cfg(windows)]
+fn delete_credential_best_effort(key: &str) {
+    match keyring::Entry::new(KEYRING_SERVICE, key) {
+        Ok(entry) => match entry.delete_credential() {
+            Ok(()) => {}
+            Err(KeyringError::NoEntry) => {}
+            Err(_) => {}
+        },
+        Err(_) => {}
+    }
+}
+
+/// Read our own `ai_providers.json` directly from `%APPDATA%\<identifier>\`
+/// and extract the list of provider IDs. Cannot use tauri-plugin-store here
+/// because no Tauri runtime is initialized in cleanup mode.
+///
+/// The folder name is `KEYRING_SERVICE` by design: it is the tauri.conf.json
+/// `identifier`, which also drives Tauri's `app_data_dir()` on Windows, so
+/// both point at the same reverse-DNS folder.
+#[cfg(windows)]
+fn enumerate_ai_provider_ids_for_cleanup() -> Vec<String> {
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return Vec::new();
+    };
+    let path = std::path::PathBuf::from(appdata)
+        .join(KEYRING_SERVICE)
+        .join("ai_providers.json");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(json): Result<serde_json::Value, _> = serde_json::from_str(&content) else {
+        return Vec::new();
+    };
+    // tauri-plugin-store wraps the payload under the store key used when
+    // calling `store.set(key, value)` — here "data" (see providers.rs).
+    // Legacy files written via std::fs used `{"providers": [...]}` at the
+    // top level; support both for safety.
+    let providers_array = json
+        .get("data")
+        .and_then(|d| d.get("providers"))
+        .or_else(|| json.get("providers"));
+
+    let Some(arr) = providers_array.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    arr.iter()
+        .filter_map(|p| p.get("id").and_then(|i| i.as_str()).map(String::from))
+        .collect()
 }

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutoStartEnabled } from "@tauri-apps/plugin-autostart";
-import { Eye, EyeOff, RefreshCw, Keyboard, Plus, Pencil, Trash2, ArrowRight, Check, X as XIcon } from "lucide-react";
+import { Eye, EyeOff, RefreshCw, Keyboard, Plus, Pencil, Trash2, ArrowRight, Check, X as XIcon, Mic } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { THEME_PRESETS, applyThemeColor } from "../../lib/theme-colors";
 import { buildHotkeyString, normalizeHotkeyString, validateHotkeyString } from "../../lib/hotkey";
@@ -9,6 +9,7 @@ import { Tooltip } from "../ui/Tooltip";
 import { RadioIndicator } from "../ui/RadioGroup";
 import { Select } from "../ui/Select";
 import { ToggleCard } from "../ui/Toggle";
+import { SliderCard } from "../ui/Slider";
 import type { AppSettings, DoubaoProviderSettings, DashScopeProviderSettings, QwenProviderSettings } from "../../App";
 import type { TextReplacement, TextReplacementsFile } from "../../lib/replacements";
 
@@ -17,6 +18,7 @@ interface AsrSettingsTabProps {
   handleChange: <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => void;
   hotkeyError: string | null;
   onHotkeyChange: (value: string) => boolean;
+  isRecording?: boolean;
 }
 
 const PROVIDER_OPTIONS = [
@@ -55,6 +57,14 @@ const ASR_MODE_OPTIONS = [
   { label: "双向流式·二遍优化（实时出字，中英文+方言）", value: "bistream" },
   { label: "流式输入（分句返回，支持方言/25种外语）", value: "nostream" },
 ];
+
+function vadSensitivityDesc(level: number): string {
+  if (level >= 9) return "极高灵敏度，适合非常安静的环境";
+  if (level >= 7) return "默认灵敏度，适合大多数环境";
+  if (level >= 5) return "中等灵敏度，可过滤风扇、空调等轻度背景噪音";
+  if (level >= 3) return "较低灵敏度，适合咖啡厅、办公室等嘈杂环境";
+  return "最低灵敏度，仅响应大声说话，适合非常嘈杂的环境";
+}
 
 const PRESET_HOTKEYS = [
   "Ctrl+Shift+V",
@@ -303,12 +313,318 @@ function ReplacementsEditor() {
   );
 }
 
-export function AsrSettingsTab({ form, handleChange, hotkeyError, onHotkeyChange }: AsrSettingsTabProps) {
+interface LevelStats {
+  avg_rms: number;
+  peak_amp: number;
+  avg_dbfs: number;
+  peak_dbfs: number;
+  sample_rate: number;
+  sample_count: number;
+}
+
+type LevelVerdict = "low" | "weak" | "good" | "hot";
+
+interface VerdictInfo {
+  verdict: LevelVerdict;
+  label: string;
+  /** 徽标配色 */
+  tone: string;
+  /** 进度条填充配色 */
+  bar: string;
+  advice: string;
+}
+
+function classifyPeak(peakDbfs: number): VerdictInfo {
+  if (peakDbfs >= -3) {
+    return {
+      verdict: "hot",
+      label: "偏高 · 削波风险",
+      tone: "text-danger bg-danger-muted border-danger/30",
+      bar: "bg-danger",
+      advice: "电平过高，可能产生削波失真，建议在 Windows 设置 > 系统 > 声音 > 麦克风 中降低输入音量",
+    };
+  }
+  if (peakDbfs >= -18) {
+    return {
+      verdict: "good",
+      label: "良好",
+      tone: "text-ok bg-ok-muted border-ok/30",
+      bar: "bg-ok",
+      advice: "电平良好，无需调整",
+    };
+  }
+  if (peakDbfs >= -30) {
+    return {
+      verdict: "weak",
+      label: "偏低",
+      tone: "text-warn bg-warn-muted border-warn/30",
+      bar: "bg-warn",
+      advice: "电平偏低但可用，如识别不准可在 Windows 设置 > 系统 > 声音 > 麦克风 中适度提高输入音量",
+    };
+  }
+  return {
+    verdict: "low",
+    label: "过低",
+    tone: "text-danger bg-danger-muted border-danger/30",
+    bar: "bg-danger",
+    advice: "电平过低，可能影响识别，请在 Windows 设置 > 系统 > 声音 > 麦克风 中提高输入音量，或靠近麦克风重试",
+  };
+}
+
+/** 将 dBFS（[-60, 0]）线性映射到进度条百分比 [0, 100] */
+function dbfsToPercent(dbfs: number): number {
+  if (!isFinite(dbfs)) return 0;
+  const clamped = Math.max(-60, Math.min(0, dbfs));
+  return ((clamped + 60) / 60) * 100;
+}
+
+/** 将 dBFS 数值格式化为显示文本，静音底噪显示为占位符 */
+function formatDbfs(dbfs: number): string {
+  if (!isFinite(dbfs) || dbfs <= -90) return "≤ -90 dB";
+  return `${dbfs.toFixed(1)} dB`;
+}
+
+type Phase = "idle" | "preparing" | "measuring" | "done" | "error";
+
+const PREP_MS = 1500;
+const REC_MS = 3000;
+
+function MicLevelTester({ deviceName, isRecording }: { deviceName: string; isRecording: boolean }) {
+  const [phase, setPhase] = useState<Phase>("idle");
+  const [progress, setProgress] = useState(0);
+  const [result, setResult] = useState<LevelStats | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const intervalRef = useRef<number | null>(null);
+  const prepTimerRef = useRef<number | null>(null);
+  const cancelledRef = useRef(false);
+
+  const cleanupTimers = useCallback(() => {
+    if (intervalRef.current !== null) {
+      window.clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+    if (prepTimerRef.current !== null) {
+      window.clearTimeout(prepTimerRef.current);
+      prepTimerRef.current = null;
+    }
+  }, []);
+
+  // 卸载时清理所有定时器，避免组件销毁后仍在 setState
+  useEffect(() => {
+    return () => {
+      cancelledRef.current = true;
+      cleanupTimers();
+    };
+  }, [cleanupTimers]);
+
+  const handleTest = useCallback(() => {
+    cleanupTimers();
+    cancelledRef.current = false;
+    setError(null);
+    setResult(null);
+    setProgress(0);
+    setPhase("preparing");
+
+    // 准备阶段：留出 1.5 秒让用户深呼吸/对准麦克风
+    const prepStart = Date.now();
+    intervalRef.current = window.setInterval(() => {
+      const t = Date.now() - prepStart;
+      setProgress(Math.min(1, t / PREP_MS));
+    }, 50);
+
+    prepTimerRef.current = window.setTimeout(async () => {
+      if (cancelledRef.current) return;
+      if (intervalRef.current !== null) {
+        window.clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+
+      // 测量阶段：后端实际采样
+      setPhase("measuring");
+      setProgress(0);
+      const measStart = Date.now();
+      intervalRef.current = window.setInterval(() => {
+        const t = Date.now() - measStart;
+        setProgress(Math.min(1, t / REC_MS));
+      }, 50);
+
+      try {
+        const stats = await invoke<LevelStats>("measure_microphone_level", {
+          deviceName: deviceName || null,
+          durationMs: REC_MS,
+        });
+        if (cancelledRef.current) return;
+        cleanupTimers();
+        setProgress(1);
+        setResult(stats);
+        setPhase("done");
+      } catch (e) {
+        if (cancelledRef.current) return;
+        cleanupTimers();
+        setError(String(e));
+        setPhase("error");
+      }
+    }, PREP_MS);
+  }, [deviceName, cleanupTimers]);
+
+  const busy = phase === "preparing" || phase === "measuring";
+  const disabled = busy || isRecording;
+
+  const buttonText = (() => {
+    if (phase === "preparing") return "准备中…";
+    if (phase === "measuring") return "录制中…";
+    if (phase === "done" || phase === "error") return "重新测试";
+    return "开始测试";
+  })();
+
+  const verdict = result ? classifyPeak(result.peak_dbfs) : null;
+  const peakPct = result ? dbfsToPercent(result.peak_dbfs) : 0;
+  const avgPct = result ? dbfsToPercent(result.avg_dbfs) : 0;
+
+  return (
+    <div className="rounded-lg border border-edge p-3 space-y-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-sm font-medium text-fg">麦克风电平测试</div>
+          <p className="text-xs text-fg-3 mt-0.5">
+            录制 3 秒人声样本，测量峰值与平均电平，帮助你判断是否需要在系统声音设置中调整麦克风输入音量
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={handleTest}
+          disabled={disabled}
+          title={isRecording ? "录音进行中，无法测试" : undefined}
+          className={cn(
+            "shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border",
+            "transition-all duration-[var(--t-fast)]",
+            disabled
+              ? "bg-surface-subtle border-edge text-fg-3 cursor-not-allowed"
+              : "bg-primary/10 border-primary/30 text-primary hover:bg-primary/15 active:scale-95"
+          )}
+        >
+          <Mic size={13} className={busy ? "animate-pulse" : ""} />
+          {buttonText}
+        </button>
+      </div>
+
+      {isRecording && phase === "idle" && (
+        <div className="text-xs text-fg-3">当前正在录音，结束后再进行测试</div>
+      )}
+
+      {phase === "preparing" && (
+        <div className="space-y-1.5">
+          <div className="text-xs text-fg-3">准备说话…</div>
+          <div className="h-1.5 rounded-full bg-surface-inset overflow-hidden">
+            <div
+              className="h-full bg-fg-3/50 transition-[width] duration-100"
+              style={{ width: `${progress * 100}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {phase === "measuring" && (
+        <div className="space-y-1.5">
+          <div className="text-xs text-fg-3">请正常说话…</div>
+          <div className="h-1.5 rounded-full bg-surface-inset overflow-hidden">
+            <div
+              className="h-full bg-primary transition-[width] duration-100"
+              style={{ width: `${progress * 100}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {phase === "error" && error && (
+        <div className="text-xs text-danger">测试失败：{error}</div>
+      )}
+
+      {phase === "done" && result && verdict && (
+        <div className="space-y-2.5">
+          <div className="flex items-center gap-2">
+            <span className={cn(
+              "inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full border",
+              verdict.tone,
+            )}>
+              {verdict.label}
+            </span>
+            <span className="text-xs text-fg-3">采样率 {result.sample_rate} Hz</span>
+          </div>
+
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2 text-xs text-fg-3">
+              <span className="w-8">峰值</span>
+              <div className="flex-1 h-1.5 rounded-full bg-surface-inset overflow-hidden relative">
+                <div
+                  className={cn("h-full transition-all", verdict.bar)}
+                  style={{ width: `${peakPct}%` }}
+                />
+              </div>
+              <span className="font-mono w-16 text-right text-fg-2">
+                {formatDbfs(result.peak_dbfs)}
+              </span>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-fg-3">
+              <span className="w-8">平均</span>
+              <div className="flex-1 h-1.5 rounded-full bg-surface-inset overflow-hidden">
+                <div
+                  className="h-full bg-fg-3/50 transition-all"
+                  style={{ width: `${avgPct}%` }}
+                />
+              </div>
+              <span className="font-mono w-16 text-right text-fg-2">
+                {formatDbfs(result.avg_dbfs)}
+              </span>
+            </div>
+          </div>
+
+          <p className="text-xs text-fg-3 leading-relaxed">{verdict.advice}</p>
+
+          <div className="pt-2.5 mt-0.5 border-t border-edge/60 space-y-2">
+            <div className="text-[11px] text-fg-3 leading-relaxed space-y-0.5">
+              <div><span className="text-fg-2">峰值</span>：本次最大瞬时音量，决定是否削波</div>
+              <div><span className="text-fg-2">平均</span>：整段语音的整体响度</div>
+            </div>
+            <div className="space-y-1">
+              <div className="text-[11px] text-fg-3">峰值参考范围（dBFS，0 = 满刻度）</div>
+              <div className="grid grid-cols-1 gap-y-0.5 text-[11px] text-fg-3 font-mono">
+                <div className="flex items-center gap-2">
+                  <span className="inline-block w-2 h-2 rounded-full bg-danger shrink-0" />
+                  <span className="w-20">&lt; -30 dB</span>
+                  <span className="font-sans">过低，几乎听不清</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="inline-block w-2 h-2 rounded-full bg-warn shrink-0" />
+                  <span className="w-20">-30 ~ -18 dB</span>
+                  <span className="font-sans">偏低，可识别但不够理想</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="inline-block w-2 h-2 rounded-full bg-ok shrink-0" />
+                  <span className="w-20">-18 ~ -3 dB</span>
+                  <span className="font-sans">良好，推荐区间</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="inline-block w-2 h-2 rounded-full bg-danger shrink-0" />
+                  <span className="w-20">≥ -3 dB</span>
+                  <span className="font-sans">偏高，存在削波失真风险</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function AsrSettingsTab({ form, handleChange, hotkeyError, onHotkeyChange, isRecording = false }: AsrSettingsTabProps) {
   const [showToken, setShowToken] = useState(false);
   const [devices, setDevices] = useState<string[]>([]);
   const [loadingDevices, setLoadingDevices] = useState(false);
   const [autoStart, setAutoStart] = useState(false);
   const [showAutoStopWarning, setShowAutoStopWarning] = useState(false);
+  const [showAdvancedAudio, setShowAdvancedAudio] = useState(false);
 
   useEffect(() => {
     isAutoStartEnabled().then(setAutoStart).catch(() => {});
@@ -356,7 +672,7 @@ export function AsrSettingsTab({ form, handleChange, hotkeyError, onHotkeyChange
         <div className="space-y-3">
           <div>
             <label className="text-sm font-medium text-fg-2 mb-2 block">主题色</label>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               {THEME_PRESETS.map((preset) => {
                 const isActive = form.theme_color === preset.id;
                 const isDark = document.documentElement.classList.contains("dark");
@@ -399,6 +715,14 @@ export function AsrSettingsTab({ form, handleChange, hotkeyError, onHotkeyChange
             label="桌面悬浮窗"
             description="录音时在桌面底部显示波形和转写文字"
           />
+          {form.show_overlay && (
+            <ToggleCard
+              checked={form.show_overlay_subtitle}
+              onChange={(v) => handleChange("show_overlay_subtitle", v)}
+              label="显示字幕"
+              description="在悬浮窗上方显示实时转写文字"
+            />
+          )}
         </div>
       </section>
 
@@ -552,10 +876,39 @@ export function AsrSettingsTab({ form, handleChange, hotkeyError, onHotkeyChange
           <ToggleCard
             checked={form.mic_always_on}
             onChange={(v) => handleChange("mic_always_on", v)}
-            label="保持麦克风就绪"
+            label={
+              <span className="flex items-center gap-1.5">
+                保持麦克风就绪
+                {!form.mic_always_on && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20 font-medium">
+                    推荐开启
+                  </span>
+                )}
+              </span>
+            }
             description={form.mic_always_on
               ? "麦克风常驻后台，录音响应更快"
-              : "每次录音时临时打开，录音前有短暂延迟"}
+              : "每次录音时临时打开，录音前有短暂延迟，开启后响应更快"}
+            className="mt-3"
+          />
+        )}
+
+        {form.audio_source !== "system" && (
+          <SliderCard
+            value={form.silence_auto_stop_secs}
+            onValueChange={(v) => handleChange("silence_auto_stop_secs", v)}
+            min={3}
+            max={60}
+            step={1}
+            label={
+              <span className="flex items-center gap-1.5">
+                静音自动停止时间
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-fg-3/10 text-fg-3 border border-fg-3/20 font-medium">默认 6 秒</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20 font-medium">推荐 5–10 秒</span>
+              </span>
+            }
+            description="检测到语音后，连续静音超过该时长将自动结束录音"
+            valueLabel={(v) => `${v}秒`}
             className="mt-3"
           />
         )}
@@ -601,6 +954,35 @@ export function AsrSettingsTab({ form, handleChange, hotkeyError, onHotkeyChange
               </div>
             )}
           </>
+        )}
+
+        {/* Advanced audio settings */}
+        <button
+          onClick={() => setShowAdvancedAudio(!showAdvancedAudio)}
+          className="mt-3 flex items-center gap-1 text-xs text-fg-3 hover:text-fg-2 transition-colors"
+        >
+          <ArrowRight size={12} className={cn("transition-transform duration-[var(--t-fast)]", showAdvancedAudio && "rotate-90")} />
+          高级
+        </button>
+        {showAdvancedAudio && (
+          <SliderCard
+            value={form.vad_sensitivity}
+            onValueChange={(v) => handleChange("vad_sensitivity", v)}
+            min={1}
+            max={10}
+            step={1}
+            label={
+              <span className="flex items-center gap-1.5 flex-wrap">
+                语音检测灵敏度
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20 font-medium">高级</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-fg-3/10 text-fg-3 border border-fg-3/20 font-medium">默认 7</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20 font-medium">推荐 5–8</span>
+              </span>
+            }
+            description={vadSensitivityDesc(form.vad_sensitivity)}
+            valueLabel={(v) => `${v}`}
+            className="mt-2"
+          />
         )}
       </section>
 
@@ -716,7 +1098,7 @@ export function AsrSettingsTab({ form, handleChange, hotkeyError, onHotkeyChange
             checked={autoStart}
             onChange={handleAutoStartChange}
             label="登录后自动启动"
-            description="系统登录后自动运行 SpeakIn"
+            description="系统登录后自动运行 SpeakIn声入"
           />
         </div>
         <div className="space-y-1.5 mt-4">
@@ -736,12 +1118,17 @@ export function AsrSettingsTab({ form, handleChange, hotkeyError, onHotkeyChange
       {/* Advanced */}
       <section>
         <h3 className="text-xs font-semibold text-fg-3 uppercase tracking-widest mb-3">高级</h3>
-        <ToggleCard
-          checked={form.debug_mode}
-          onChange={(v) => handleChange("debug_mode", v)}
-          label="调试模式"
-          description="显示网络日志和 AI 请求日志"
-        />
+        <div className="space-y-3">
+          {form.audio_source !== "system" && (
+            <MicLevelTester deviceName={form.device_name} isRecording={isRecording} />
+          )}
+          <ToggleCard
+            checked={form.debug_mode}
+            onChange={(v) => handleChange("debug_mode", v)}
+            label="调试模式"
+            description="显示网络日志和 AI 请求日志"
+          />
+        </div>
       </section>
     </div>
   );

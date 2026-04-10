@@ -19,6 +19,7 @@ interface SettingsProps {
   onSave: (settings: AppSettings) => Promise<AppSettings>;
   onClose: () => void;
   initialTab?: string;
+  isRecording?: boolean;
 }
 
 type TabId = "asr" | "ai" | "ai-providers" | "prompts" | "stats";
@@ -31,7 +32,7 @@ const TABS: { id: TabId; label: string; icon: LucideIcon }[] = [
   { id: "stats", label: "统计", icon: BarChart3 },
 ];
 
-export function Settings({ settings, onSave, onClose, initialTab }: SettingsProps) {
+export function Settings({ settings, onSave, onClose, initialTab, isRecording = false }: SettingsProps) {
   const [activeTab, setActiveTab] = useState<TabId>((initialTab as TabId) || "asr");
   const [form, setForm] = useState<AppSettings>({ ...settings });
   const [saved, setSaved] = useState(false);
@@ -107,6 +108,7 @@ export function Settings({ settings, onSave, onClose, initialTab }: SettingsProp
       promptsData: { prompts: updatedPrompts },
     });
     setPrompts(updatedPrompts);
+    invoke("rebuild_tray_menu_cmd").catch(() => {});
   };
 
   const showSaveButton = activeTab === "asr" || activeTab === "ai";
@@ -163,6 +165,7 @@ export function Settings({ settings, onSave, onClose, initialTab }: SettingsProp
                 handleChange={handleChange}
                 hotkeyError={hotkeyError}
                 onHotkeyChange={handleHotkeyChange}
+                isRecording={isRecording}
               />
             )}
             {activeTab === "ai" && (

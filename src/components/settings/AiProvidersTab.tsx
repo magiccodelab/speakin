@@ -236,6 +236,7 @@ export function AiProvidersTab({ providers, onProvidersChange, onAiSettingsSync 
       onProvidersChange(providers.filter((x) => x.id !== p.id));
       // Sync form state: if the deleted provider was active, backend already disabled AI
       onAiSettingsSync(updatedAiSettings);
+      invoke("rebuild_tray_menu_cmd").catch(() => {});
     } catch (e) {
       setError(String(e));
     }
@@ -291,6 +292,7 @@ export function AiProvidersTab({ providers, onProvidersChange, onAiSettingsSync 
       }
 
       setEditing(null);
+      invoke("rebuild_tray_menu_cmd").catch(() => {});
     } catch (e) {
       setError(String(e));
     }

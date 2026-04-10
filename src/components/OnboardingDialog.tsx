@@ -123,7 +123,7 @@ export function OnboardingDialog({ open, onClose, onConfigure }: OnboardingDialo
     exit: (dir: number) => ({ x: dir > 0 ? -32 : 32, opacity: 0 }),
   };
 
-  const ctaLabel = step === TOTAL_STEPS - 1 ? "开始使用 SpeakIn" : "下一步";
+  const ctaLabel = step === TOTAL_STEPS - 1 ? "开始使用 SpeakIn声入" : "下一步";
 
   return (
     <AnimatePresence>
@@ -141,7 +141,7 @@ export function OnboardingDialog({ open, onClose, onConfigure }: OnboardingDialo
             key="onboarding-dialog"
             role="dialog"
             aria-modal="true"
-            aria-label="欢迎使用 SpeakIn"
+            aria-label="欢迎使用 SpeakIn声入"
             className="absolute inset-0 z-[120] flex items-center justify-center pointer-events-none"
             initial={{ opacity: 0, scale: 0.96 }}
             animate={{ opacity: 1, scale: 1 }}
@@ -156,7 +156,7 @@ export function OnboardingDialog({ open, onClose, onConfigure }: OnboardingDialo
                     <Mic size={14} className="text-primary-fg" />
                   </div>
                   <span className="text-[15px] font-semibold tracking-tight text-fg">
-                    SpeakIn
+                    SpeakIn声入
                   </span>
                 </div>
                 <div className="flex items-center gap-1.5">

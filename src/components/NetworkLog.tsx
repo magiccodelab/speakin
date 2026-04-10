@@ -39,7 +39,7 @@ export function NetworkLog({ logs, onClear }: NetworkLogProps) {
       >
         <div className="flex items-center gap-2">
           {expanded ? <ChevronDown size={14} className="text-fg-3" /> : <ChevronUp size={14} className="text-fg-3" />}
-          <span className="text-xs font-medium text-fg-3 uppercase tracking-wider">Network</span>
+          <span className="text-xs font-medium text-fg-3 tracking-wider">运行日志</span>
           <span className="text-xs text-fg-3">({logs.length})</span>
           {logs.length > 0 && !expanded && (
             <span className="text-xs text-fg-3 truncate max-w-[200px] font-mono">
@@ -69,7 +69,7 @@ export function NetworkLog({ logs, onClear }: NetworkLogProps) {
           ) : (
             logs.map((log, i) => (
               <div key={i} className="flex gap-2 hover:bg-surface-subtle/50 px-1 rounded">
-                <span className="text-fg-3 shrink-0 w-[72px]">{log.ts}</span>
+                <span className="text-fg-3 shrink-0 w-[168px]">{log.ts}</span>
                 <span className={cn("shrink-0 w-[36px] uppercase font-semibold", LEVEL_COLORS[log.level] || "text-fg-3")}>
                   {log.level}
                 </span>

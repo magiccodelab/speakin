@@ -53,7 +53,7 @@ export function AboutDialog({ open: isOpen, onClose }: AboutDialogProps) {
             key="about-dialog"
             role="dialog"
             aria-modal="true"
-            aria-label="关于 SpeakIn"
+            aria-label="关于 SpeakIn声入"
             className="absolute inset-0 z-[120] flex items-center justify-center pointer-events-none"
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
@@ -66,7 +66,7 @@ export function AboutDialog({ open: isOpen, onClose }: AboutDialogProps) {
             >
               {/* Header */}
               <div className="text-center mb-4">
-                <h3 className="text-lg font-bold text-fg">SpeakIn 声入</h3>
+                <h3 className="text-lg font-bold text-fg">SpeakIn声入</h3>
                 <p className="text-sm text-fg-3 mt-0.5">v{version}</p>
                 <p className="text-xs text-fg-3 mt-1">多平台 ASR 语音输入工具</p>
               </div>
