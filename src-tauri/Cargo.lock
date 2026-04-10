@@ -4427,7 +4427,7 @@ dependencies = [
 
 [[package]]
 name = "speakin"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "arboard",
  "base64 0.22.1",

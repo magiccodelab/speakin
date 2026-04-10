@@ -1,6 +1,6 @@
 [package]
 name = "speakin"
-version = "1.0.8"
+version = "1.0.9"
 description = "SpeakIn声入 - 全局热键语音输入工具，支持豆包/百炼/千问 ASR 与 AI 优化"
 authors = ["magiccodelab", "afengblog"]
 license = "GPL-3.0"
