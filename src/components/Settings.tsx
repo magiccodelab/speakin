@@ -32,14 +32,31 @@ const TABS: { id: TabId; label: string; icon: LucideIcon }[] = [
   { id: "stats", label: "统计", icon: BarChart3 },
 ];
 
+function getAiOptimizeValidationError(
+  form: AppSettings,
+  aiProviders: AiProvider[],
+  providersLoaded: boolean,
+): string | null {
+  if (!form.ai_optimize.enabled) return null;
+  if (!providersLoaded) return "正在加载 AI 供应商，请稍后再保存";
+  if (aiProviders.length === 0) return "启用 AI 优化前，请先添加 AI 供应商";
+  if (!form.ai_optimize.active_provider_id.trim()) return "启用 AI 优化前，请先选择 AI 供应商";
+  if (!aiProviders.some((p) => p.id === form.ai_optimize.active_provider_id)) {
+    return "所选 AI 供应商不存在，请重新选择";
+  }
+  return null;
+}
+
 export function Settings({ settings, onSave, onClose, initialTab, isRecording = false }: SettingsProps) {
   const [activeTab, setActiveTab] = useState<TabId>((initialTab as TabId) || "asr");
   const [form, setForm] = useState<AppSettings>({ ...settings });
   const [saved, setSaved] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [hotkeyError, setHotkeyError] = useState<string | null>(null);
   const [prompts, setPrompts] = useState<PromptTemplate[]>([]);
   const [aiProviders, setAiProviders] = useState<AiProvider[]>([]);
+  const [aiProvidersLoaded, setAiProvidersLoaded] = useState(false);
   const savedTimerRef = useRef<number | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -50,7 +67,8 @@ export function Settings({ settings, onSave, onClose, initialTab, isRecording = 
       .catch(() => {});
     invoke<AiProvidersFile>("get_ai_providers")
       .then((data) => setAiProviders(data.providers))
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => setAiProvidersLoaded(true));
   }, []);
 
   useEffect(() => () => {
@@ -62,6 +80,7 @@ export function Settings({ settings, onSave, onClose, initialTab, isRecording = 
   const handleChange = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
     setForm((prev) => ({ ...prev, [key]: value }));
     setSaved(false);
+    setSaveError(null);
   };
 
   const handleHotkeyChange = (value: string) => {
@@ -70,6 +89,7 @@ export function Settings({ settings, onSave, onClose, initialTab, isRecording = 
     if (!normalized || error) {
       setHotkeyError(error ?? "快捷键格式无效，请重新录制");
       setSaved(false);
+      setSaveError(null);
       return false;
     }
     setHotkeyError(null);
@@ -82,8 +102,16 @@ export function Settings({ settings, onSave, onClose, initialTab, isRecording = 
       const error = validateHotkeyString(form.hotkey);
       if (error) {
         setHotkeyError(error);
+        setSaveError(error);
         return;
       }
+    }
+
+    const aiError = getAiOptimizeValidationError(form, aiProviders, aiProvidersLoaded);
+    if (aiError) {
+      setSaveError(aiError);
+      setSaved(false);
+      return;
     }
 
     setSaving(true);
@@ -91,12 +119,14 @@ export function Settings({ settings, onSave, onClose, initialTab, isRecording = 
       const savedSettings = await onSave(form);
       setForm(savedSettings);
       setHotkeyError(null);
+      setSaveError(null);
       setSaved(true);
       if (savedTimerRef.current !== null) {
         window.clearTimeout(savedTimerRef.current);
       }
       savedTimerRef.current = window.setTimeout(() => setSaved(false), 2000);
-    } catch {
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e));
       setSaved(false);
     } finally {
       setSaving(false);
@@ -112,6 +142,8 @@ export function Settings({ settings, onSave, onClose, initialTab, isRecording = 
   };
 
   const showSaveButton = activeTab === "asr" || activeTab === "ai";
+  const aiOptimizeError = getAiOptimizeValidationError(form, aiProviders, aiProvidersLoaded);
+  const saveDisabled = saving || !!hotkeyError || !!aiOptimizeError;
 
   return (
     <div className="flex flex-col flex-1 min-h-0 overflow-hidden">
@@ -174,14 +206,20 @@ export function Settings({ settings, onSave, onClose, initialTab, isRecording = 
                 handleChange={handleChange}
                 providers={aiProviders}
                 prompts={prompts}
+                providersLoaded={aiProvidersLoaded}
+                validationError={aiOptimizeError}
               />
             )}
             {activeTab === "ai-providers" && (
               <AiProvidersTab
                 providers={aiProviders}
-                onProvidersChange={setAiProviders}
+                onProvidersChange={(providers) => {
+                  setAiProviders(providers);
+                  setSaveError(null);
+                }}
                 onAiSettingsSync={(aiSettings) => {
                   setForm((prev) => ({ ...prev, ai_optimize: aiSettings }));
+                  setSaveError(null);
                 }}
               />
             )}
@@ -219,7 +257,10 @@ export function Settings({ settings, onSave, onClose, initialTab, isRecording = 
             className="shrink-0 overflow-hidden"
           >
             <div className="px-5 py-4 border-t border-edge">
-              <button onClick={handleSaveSettings} disabled={saving || !!hotkeyError}
+              {(saveError || aiOptimizeError) && (
+                <p className="mb-2 text-sm text-danger-muted-fg">{saveError || aiOptimizeError}</p>
+              )}
+              <button onClick={handleSaveSettings} disabled={saveDisabled}
                 className={cn("w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all duration-[var(--t-base)]",
                   saved ? "bg-ok-muted text-ok-muted-fg" : "bg-primary text-primary-fg hover:shadow-[0_0_24px_-4px_hsl(var(--primary)/0.4)] hover:-translate-y-px active:translate-y-0 active:shadow-none",
                   "disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:translate-y-0 disabled:hover:shadow-none")}>

@@ -9,14 +9,37 @@ interface AiOptimizeTabProps {
   handleChange: <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => void;
   providers: AiProvider[];
   prompts: PromptTemplate[];
+  providersLoaded?: boolean;
+  validationError?: string | null;
 }
 
-export function AiOptimizeTab({ form, handleChange, providers, prompts }: AiOptimizeTabProps) {
+export function AiOptimizeTab({
+  form,
+  handleChange,
+  providers,
+  prompts,
+  providersLoaded = true,
+  validationError,
+}: AiOptimizeTabProps) {
   const handleAiChange = <K extends keyof AiOptimizeSettings>(key: K, value: AiOptimizeSettings[K]) => {
     handleChange("ai_optimize" as keyof AppSettings, { ...form.ai_optimize, [key]: value } as any);
   };
 
-  const providerOptions = providers.map((p) => ({ label: p.name, value: p.id }));
+  const hasProviders = providers.length > 0;
+  const activeProviderExists = providers.some((p) => p.id === form.ai_optimize.active_provider_id);
+  const selectedProviderId = activeProviderExists ? form.ai_optimize.active_provider_id : "";
+  const providerOptions = [
+    { label: "请选择 AI 供应商", value: "" },
+    ...providers.map((p) => ({ label: p.name, value: p.id })),
+  ];
+  const canToggleAiOptimize = form.ai_optimize.enabled || (providersLoaded && hasProviders);
+  const enableDescription = !providersLoaded
+    ? "正在加载 AI 供应商"
+    : !hasProviders
+      ? "先在「供应商」页签添加 AI 供应商后才能开启"
+      : form.ai_optimize.enabled
+        ? "录音结束后自动通过 AI 优化转写文本"
+        : "关闭后直接输出原始转写文本";
 
   // Group prompts by category, preserving first-seen order
   const promptGroups: SelectGroup[] = (() => {
@@ -40,9 +63,8 @@ export function AiOptimizeTab({ form, handleChange, providers, prompts }: AiOpti
         checked={form.ai_optimize.enabled}
         onChange={(v) => handleAiChange("enabled", v)}
         label="启用 AI 优化"
-        description={form.ai_optimize.enabled
-          ? "录音结束后自动通过 AI 优化转写文本"
-          : "关闭后直接输出原始转写文本"}
+        description={enableDescription}
+        disabled={!canToggleAiOptimize}
       />
 
       {form.ai_optimize.enabled && (
@@ -50,11 +72,16 @@ export function AiOptimizeTab({ form, handleChange, providers, prompts }: AiOpti
           {/* Provider Selection */}
           <section>
             <h3 className="text-xs font-semibold text-fg-3 uppercase tracking-widest mb-3">AI 供应商</h3>
-            {providerOptions.length > 0 ? (
-              <Select value={form.ai_optimize.active_provider_id} options={providerOptions}
+            {hasProviders ? (
+              <Select value={selectedProviderId} options={providerOptions}
                 onChange={(v) => handleAiChange("active_provider_id", v)} />
             ) : (
-              <p className="text-sm text-fg-3 py-2">还没有 AI 供应商，前往「供应商」页签添加</p>
+              <p className="text-sm text-fg-3 py-2">
+                {providersLoaded ? "还没有 AI 供应商，前往「供应商」页签添加" : "正在加载 AI 供应商..."}
+              </p>
+            )}
+            {validationError && (
+              <p className="text-xs text-danger-muted-fg mt-1.5">{validationError}</p>
             )}
           </section>
 

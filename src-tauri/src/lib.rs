@@ -385,13 +385,53 @@ fn normalize_settings_for_save(
     mut settings: AppSettings,
 ) -> Result<(AppSettings, hotkey::ValidatedHotkey, InputMode), String> {
     settings.input_mode = normalize_input_mode(&settings.input_mode);
+    settings.ai_optimize.active_provider_id =
+        settings.ai_optimize.active_provider_id.trim().to_string();
+    settings.ai_optimize.active_prompt_id =
+        settings.ai_optimize.active_prompt_id.trim().to_string();
     let input_mode = input_mode_from_str(&settings.input_mode);
     let hotkey = hotkey::validate_hotkey(&settings.hotkey)?;
     settings.hotkey = hotkey.normalized().to_string();
     Ok((settings, hotkey, input_mode))
 }
 
-fn sanitize_loaded_settings(mut settings: AppSettings) -> (AppSettings, Option<String>, bool) {
+fn append_startup_warning(warning: &mut Option<String>, msg: String) {
+    *warning = Some(match warning.take() {
+        Some(existing) => format!("{}；{}", existing, msg),
+        None => msg,
+    });
+}
+
+fn has_selected_ai_provider(
+    settings: &AppSettings,
+    ai_providers: &[ai::providers::AiProvider],
+) -> bool {
+    !settings.ai_optimize.active_provider_id.is_empty()
+        && ai_providers
+            .iter()
+            .any(|p| p.id == settings.ai_optimize.active_provider_id)
+}
+
+fn validate_ai_optimize_settings(
+    settings: &AppSettings,
+    ai_providers: &[ai::providers::AiProvider],
+) -> Result<(), String> {
+    if !settings.ai_optimize.enabled {
+        return Ok(());
+    }
+    if settings.ai_optimize.active_provider_id.is_empty() {
+        return Err("启用 AI 优化前，请先选择 AI 供应商".to_string());
+    }
+    if !has_selected_ai_provider(settings, ai_providers) {
+        return Err("所选 AI 供应商不存在，请重新选择".to_string());
+    }
+    Ok(())
+}
+
+fn sanitize_loaded_settings(
+    mut settings: AppSettings,
+    ai_providers: &[ai::providers::AiProvider],
+) -> (AppSettings, Option<String>, bool) {
     let mut should_persist = false;
     let mut warning = None;
 
@@ -414,10 +454,10 @@ fn sanitize_loaded_settings(mut settings: AppSettings) -> (AppSettings, Option<S
                 .expect("default hotkey must be valid");
             settings.hotkey = default_hotkey.normalized().to_string();
             should_persist = true;
-            warning = Some(format!(
-                "检测到无效热键配置（{}），已回退为 {}",
-                err, settings.hotkey
-            ));
+            append_startup_warning(
+                &mut warning,
+                format!("检测到无效热键配置（{}），已回退为 {}", err, settings.hotkey),
+            );
         }
     }
 
@@ -447,6 +487,31 @@ fn sanitize_loaded_settings(mut settings: AppSettings) -> (AppSettings, Option<S
     if settings.vad_sensitivity < 1 || settings.vad_sensitivity > 10 {
         settings.vad_sensitivity = default_vad_sensitivity();
         should_persist = true;
+    }
+
+    let trimmed_ai_provider = settings.ai_optimize.active_provider_id.trim().to_string();
+    if trimmed_ai_provider != settings.ai_optimize.active_provider_id {
+        settings.ai_optimize.active_provider_id = trimmed_ai_provider;
+        should_persist = true;
+    }
+    let trimmed_ai_prompt = settings.ai_optimize.active_prompt_id.trim().to_string();
+    if trimmed_ai_prompt != settings.ai_optimize.active_prompt_id {
+        settings.ai_optimize.active_prompt_id = trimmed_ai_prompt;
+        should_persist = true;
+    }
+    if !settings.ai_optimize.active_provider_id.is_empty()
+        && !has_selected_ai_provider(&settings, ai_providers)
+    {
+        settings.ai_optimize.active_provider_id.clear();
+        should_persist = true;
+    }
+    if settings.ai_optimize.enabled && !has_selected_ai_provider(&settings, ai_providers) {
+        settings.ai_optimize.enabled = false;
+        should_persist = true;
+        append_startup_warning(
+            &mut warning,
+            "AI 优化已关闭：启用前需要先选择 AI 供应商".to_string(),
+        );
     }
 
     (settings, warning, should_persist)
@@ -547,6 +612,8 @@ fn save_settings(
     settings: AppSettings,
 ) -> Result<AppSettings, String> {
     let (settings, validated_hotkey, input_mode) = normalize_settings_for_save(settings)?;
+    let ai_providers = state.cached_providers.lock().providers.clone();
+    validate_ai_optimize_settings(&settings, &ai_providers)?;
     storage::save_settings(&app_handle, &settings)?;
 
     let should_stop_recording = {
@@ -1324,8 +1391,10 @@ fn build_tray_menu(
     let sep1 = PredefinedMenuItem::separator(app)?;
 
     // ── AI 优化区 ──
+    let can_enable_ai = has_selected_ai_provider(settings, ai_providers);
     let ai_item = CheckMenuItemBuilder::with_id("tray_ai", "AI 优化")
-        .checked(settings.ai_optimize.enabled)
+        .checked(settings.ai_optimize.enabled && can_enable_ai)
+        .enabled(settings.ai_optimize.enabled || can_enable_ai)
         .build(app)?;
 
     // 提示词子菜单
@@ -1565,8 +1634,12 @@ pub fn run() {
             let app_handle = app.handle().clone();
 
             // Load and sanitize settings (requires AppHandle for store plugin)
-            let (settings, mut startup_warning, should_persist) =
-                sanitize_loaded_settings(storage::load_settings(&app_handle));
+            let providers_file = ai::providers::load_providers(&app_handle);
+            let prompts_file = ai::prompts::load_prompts(&app_handle);
+            let (settings, mut startup_warning, should_persist) = sanitize_loaded_settings(
+                storage::load_settings(&app_handle),
+                &providers_file.providers,
+            );
             if should_persist {
                 if let Err(err) = storage::save_settings(&app_handle, &settings) {
                     let msg = format!("启动时规范化设置失败: {}", err);
@@ -1622,8 +1695,8 @@ pub fn run() {
                 })),
                 stats: Mutex::new(usage_stats),
                 cached_replacements: Mutex::new(replacements::load_replacements(&app_handle)),
-                cached_providers: Mutex::new(ai::providers::load_providers(&app_handle)),
-                cached_prompts: Mutex::new(ai::prompts::load_prompts(&app_handle)),
+                cached_providers: Mutex::new(providers_file),
+                cached_prompts: Mutex::new(prompts_file),
             };
 
             let state_inner = state.inner.clone();
@@ -1660,9 +1733,24 @@ pub fn run() {
                             "tray_show" => show_main_window(app),
 
                             "tray_ai" => {
-                                tray_update_setting(app, |s| {
-                                    s.ai_optimize.enabled = !s.ai_optimize.enabled;
-                                });
+                                let can_toggle = {
+                                    let state = app.state::<AppState>();
+                                    let settings = state.inner.lock().settings.clone();
+                                    let providers = state.cached_providers.lock().providers.clone();
+                                    settings.ai_optimize.enabled
+                                        || has_selected_ai_provider(&settings, &providers)
+                                };
+                                if can_toggle {
+                                    tray_update_setting(app, |s| {
+                                        s.ai_optimize.enabled = !s.ai_optimize.enabled;
+                                    });
+                                } else {
+                                    show_main_window(app);
+                                    let _ = app.emit(
+                                        "settings-warning",
+                                        "启用 AI 优化前，请先选择 AI 供应商",
+                                    );
+                                }
                             }
 
                             "tray_about" => {
