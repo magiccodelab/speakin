@@ -151,13 +151,25 @@
     -webkit-user-select: none;
   }
 
-  /* Main window: round the #root container's corners. Works together with
-   * `"transparent": true` in tauri.conf.json so the four corner quadrants
-   * truly show the desktop underneath instead of a dark rectangle.
-   * The overlay window (html.overlay-window) already has its own rules
-   * below, and its #root stays unclipped. */
+  /* Main window: round the #root container's corners.
+   *
+   * The radius MUST match Windows 11's default DWM corner rounding (~8px)
+   * to avoid a visible "double edge" at the corners. With `transparent:
+   * true` + `decorations: false`, DWM still clips the top-level HWND to
+   * its standard corner radius. If our CSS radius is larger than the OS
+   * radius, the annulus between the two curves ends up "inside the OS
+   * window but outside our painted content" — and because the window is
+   * transparent, that annulus shows the desktop, producing the seam
+   * reported during v1.0.11 development.
+   *
+   * Keeping `border-radius: 8px` aligns CSS with Win11 native windows
+   * (Explorer, Settings, etc.) so there's no mismatch, no double edge,
+   * and the visible shape is a single clean curve composited by DWM.
+   *
+   * The overlay window (html.overlay-window) has its own transparent-bg
+   * rules below and its #root stays unclipped. */
   html:not(.overlay-window) #root {
-    border-radius: 14px;
+    border-radius: 8px;
     overflow: hidden;
     height: 100vh;
   }

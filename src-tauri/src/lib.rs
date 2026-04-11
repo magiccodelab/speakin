@@ -1881,36 +1881,15 @@ pub fn run() {
                     let _ = window.set_icon(icon);
                 }
 
-                // Disable Windows 11's automatic window corner rounding so
-                // the CSS-side `border-radius` on #root is the sole source
-                // of visible curvature.
-                //
-                // Without this, DWM clips the window to its default ~8px
-                // radius while our CSS clips content to 14px. At each
-                // corner the 8–14px annulus ends up "inside the OS window
-                // but outside our painted content" and, because the
-                // window is also `transparent: true`, that annulus shows
-                // the desktop through — producing a visible seam between
-                // the OS's rounding and ours. Switching DWMWA_WINDOW_CORNER_
-                // PREFERENCE to DWMWCP_DONOTROUND makes the OS window a
-                // sharp rectangle so our CSS shape takes over cleanly.
-                #[cfg(windows)]
-                if let Ok(hwnd) = window.hwnd() {
-                    use windows_sys::Win32::Graphics::Dwm::{
-                        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE,
-                        DWMWCP_DONOTROUND,
-                    };
-                    let raw: windows_sys::Win32::Foundation::HWND = hwnd.0 as _;
-                    let pref = DWMWCP_DONOTROUND;
-                    unsafe {
-                        DwmSetWindowAttribute(
-                            raw,
-                            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
-                            &pref as *const _ as *const _,
-                            std::mem::size_of_val(&pref) as u32,
-                        );
-                    }
-                }
+                // Leave Windows 11's default corner rounding alone. With
+                // `decorations: false` + `transparent: true`, DWM still
+                // clips the top-level HWND to its standard ~8px corner
+                // radius. Our CSS on `#root` must match that radius —
+                // any larger and a crescent between the two curves ends
+                // up "inside the OS window but outside our painted
+                // content", producing a visible seam because the window
+                // is transparent. See index.css for the matching 8px
+                // `border-radius`.
             }
 
             let hotkey_rx = hotkey::start_listener(&hotkey, input_mode);
