@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutoStartEnabled } from "@tauri-apps/plugin-autostart";
 import { Eye, EyeOff, RefreshCw, Keyboard, Plus, Pencil, Trash2, ArrowRight, Check, X as XIcon, Mic } from "lucide-react";
 import { cn } from "../../lib/utils";
@@ -625,9 +627,11 @@ export function AsrSettingsTab({ form, handleChange, hotkeyError, onHotkeyChange
   const [autoStart, setAutoStart] = useState(false);
   const [showAutoStopWarning, setShowAutoStopWarning] = useState(false);
   const [showAdvancedAudio, setShowAdvancedAudio] = useState(false);
+  const [appVersion, setAppVersion] = useState("");
 
   useEffect(() => {
     isAutoStartEnabled().then(setAutoStart).catch(() => {});
+    getVersion().then(setAppVersion).catch(() => {});
   }, []);
 
   const handleAutoStartChange = async (v: boolean) => {
@@ -1112,6 +1116,25 @@ export function AsrSettingsTab({ form, handleChange, hotkeyError, onHotkeyChange
             ]}
             onChange={(v) => handleChange("close_behavior", v as "ask" | "minimize" | "quit")}
           />
+        </div>
+        <div className="mt-4 flex items-center justify-between p-3 rounded-lg border border-edge">
+          <div className="min-w-0 pr-3">
+            <div className="text-sm font-medium text-fg">检查更新</div>
+            <div className="text-xs text-fg-3 mt-0.5">
+              当前版本 {appVersion ? `v${appVersion}` : "加载中…"} · 前往 GitHub 查看最新发布
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => openUrl("https://github.com/magiccodelab/speakin/releases").catch(() => {})}
+            className={cn(
+              "shrink-0 px-3 py-1.5 text-xs font-medium rounded-md border",
+              "bg-primary/10 border-primary/30 text-primary",
+              "hover:bg-primary/15 active:scale-95 transition-all duration-[var(--t-fast)]"
+            )}
+          >
+            检查更新
+          </button>
         </div>
       </section>
 

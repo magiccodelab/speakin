@@ -67,7 +67,17 @@ export function AboutDialog({ open: isOpen, onClose }: AboutDialogProps) {
               {/* Header */}
               <div className="text-center mb-4">
                 <h3 className="text-lg font-bold text-fg">SpeakIn声入</h3>
-                <p className="text-sm text-fg-3 mt-0.5">v{version}</p>
+                <div className="flex items-center justify-center gap-2 mt-0.5">
+                  <p className="text-sm text-fg-3">v{version}</p>
+                  <span className="text-fg-3/40">·</span>
+                  <button
+                    type="button"
+                    onClick={() => handleOpenUrl("https://github.com/magiccodelab/speakin/releases")}
+                    className="text-xs text-primary hover:underline active:scale-95 transition-all"
+                  >
+                    检查更新
+                  </button>
+                </div>
                 <p className="text-xs text-fg-3 mt-1">多平台 ASR 语音输入工具</p>
               </div>
 
