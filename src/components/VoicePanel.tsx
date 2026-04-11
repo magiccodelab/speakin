@@ -1,13 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { cn } from "../lib/utils";
 import { Mic, MicOff, Loader2, Sparkles } from "lucide-react";
 import type { AppSettings } from "../App";
+import { OceanWave } from "./OceanWave";
 
-const BAR_COUNT = 7;
-const MIN_H = 4;
-const MAX_H = 28;
-const BAR_WEIGHTS = [0.45, 0.65, 0.85, 1.0, 0.85, 0.65, 0.45];
+// Height of the ocean-wave visualizer below the mic button. Tall enough
+// for the ribbon to look prominent, compact enough to keep the panel
+// visually centered.
+const VISUALIZER_HEIGHT = 44;
 
 interface VoicePanelProps {
   isRecording: boolean;
@@ -16,17 +17,21 @@ interface VoicePanelProps {
   isProcessingSlow?: boolean;
   isOptimizing: boolean;
   hasError: boolean;
+  /**
+   * Short contextual label shown when `hasError` is true. Defaults to
+   * "识别失败" when null so the status row never goes blank on errors.
+   */
+  errorLabel?: string | null;
   onToggle: () => void;
   settings: AppSettings;
 }
 
-export function VoicePanel({ isRecording, isProcessing, isProcessingSlow, isOptimizing, hasError, onToggle, settings }: VoicePanelProps) {
-  const [heights, setHeights] = useState<number[]>(() => Array(BAR_COUNT).fill(MIN_H));
+export function VoicePanel({ isRecording, isProcessing, isProcessingSlow, isOptimizing, hasError, errorLabel, onToggle, settings }: VoicePanelProps) {
   const levelRef = useRef(0);
-  const smoothRef = useRef(0);
-  const rafRef = useRef(0);
 
-  // Listen to real-time audio level
+  // Listen to real-time audio level (written to the ref, not state — the
+  // OceanWave component's RAF loop reads from this ref directly, so we
+  // avoid a React re-render on every audio-level event).
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     listen<number>("audio-level", (e) => {
@@ -35,34 +40,27 @@ export function VoicePanel({ isRecording, isProcessing, isProcessingSlow, isOpti
     return () => unlisten?.();
   }, []);
 
-  // Animate bars based on audio level (~30fps)
+  // Zero the level ref whenever we leave the recording state so the ocean
+  // wave's internal smoothing decays back to baseline during processing /
+  // optimizing / error. Baseline amp is still non-zero, so the visualizer
+  // stays subtly animated even at level=0 — signalling "still doing work".
   useEffect(() => {
     if (!isRecording) {
-      smoothRef.current = 0;
       levelRef.current = 0;
-      setHeights(Array(BAR_COUNT).fill(MIN_H));
-      return;
     }
-    let running = true;
-    const animate = () => {
-      if (!running) return;
-      const target = levelRef.current;
-      const alpha = target > smoothRef.current ? 0.35 : 0.1;
-      smoothRef.current += (target - smoothRef.current) * alpha;
-      const level = smoothRef.current;
-      setHeights(BAR_WEIGHTS.map(
-        (w) => MIN_H + (MAX_H - MIN_H) * Math.min(level * w, 1)
-      ));
-      rafRef.current = requestAnimationFrame(animate);
-    };
-    rafRef.current = requestAnimationFrame(animate);
-    return () => { running = false; cancelAnimationFrame(rafRef.current); };
   }, [isRecording]);
 
   const showVisualizer = isRecording || isProcessing || isOptimizing || hasError;
 
+  // One color source for both the button accents and the ocean wave ribbon.
+  const waveColor = hasError
+    ? "hsl(var(--danger))"
+    : isRecording
+      ? "hsl(var(--recording))"
+      : "hsl(var(--primary))";
+
   return (
-    <div className="flex flex-col items-center gap-4 shrink-0">
+    <div className="flex flex-col items-center gap-4 shrink-0 w-full">
       {/* Mic Button */}
       <div className="relative">
         {/* Pulse rings — always rendered, opacity-controlled */}
@@ -114,37 +112,28 @@ export function VoicePanel({ isRecording, isProcessing, isProcessingSlow, isOpti
         </button>
       </div>
 
-      {/* Audio Visualizer — real-time when recording, gentle CSS animation for other states */}
-      <div className={cn(
-        "flex items-center gap-[3px] transition-all duration-[var(--t-fast)]",
-        showVisualizer ? "opacity-100 scale-100" : "opacity-0 scale-95 pointer-events-none"
-      )} style={{ height: MAX_H }}>
-        {Array.from({ length: BAR_COUNT }).map((_, i) => (
-          <div
-            key={i}
-            className="w-1 rounded-full"
-            style={{
-              backgroundColor: hasError
-                ? "hsl(var(--danger))"
-                : isRecording
-                  ? "hsl(var(--recording))"
-                  : "hsl(var(--primary))",
-              height: isRecording
-                ? heights[i]
-                : MIN_H,
-              transition: isRecording
-                ? "height 60ms ease-out, background-color 300ms"
-                : "height 300ms ease-in-out, background-color 300ms",
-              animation: hasError
-                ? `wave-gentle 2s ease-in-out ${i * 0.15}s infinite`
-                : !isRecording && (isProcessing || isOptimizing)
-                  ? isOptimizing
-                    ? `wave-gentle 2.5s ease-in-out ${i * 0.18}s infinite`
-                    : `wave-medium 1.8s ease-in-out ${i * 0.15}s infinite`
-                  : "none",
-            }}
-          />
-        ))}
+      {/* Ocean wave visualizer — the sole audio indicator on the main page.
+          When idle, the container's height collapses to 0 so the status
+          text below moves up smoothly into the freed space (flex reflow
+          interpolates the layout for us during the height transition).
+          This is how the "按热键或点击麦克风" hint visibly rises closer to
+          the mic button instead of sitting low with a dead gap above it. */}
+      <div
+        className={cn(
+          "relative w-full overflow-hidden transition-all duration-[var(--t-base)]",
+          showVisualizer
+            ? "opacity-100 scale-100"
+            : "opacity-0 scale-95 pointer-events-none"
+        )}
+        style={{ height: showVisualizer ? VISUALIZER_HEIGHT : 0 }}
+      >
+        <OceanWave
+          levelRef={levelRef}
+          active={showVisualizer}
+          color={waveColor}
+          className="absolute inset-0 w-full h-full"
+          viewHeight={VISUALIZER_HEIGHT}
+        />
       </div>
 
       {/* Status Text */}
@@ -155,7 +144,7 @@ export function VoicePanel({ isRecording, isProcessing, isProcessingSlow, isOpti
         {hasError ? (
           <span className="flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-danger" />
-            识别失败
+            {errorLabel ?? "识别失败"}
           </span>
         ) : isOptimizing ? (
           <span className="flex items-center gap-2">

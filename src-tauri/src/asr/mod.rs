@@ -133,10 +133,20 @@ pub(crate) fn finalize_session(
     // frame, or a finish-task write that failed. Without this promotion,
     // `status()` would return `no_speech` and the UI would close
     // silently, masking the real failure from the user.
+    //
+    // Guard: only promote if the session was long enough to plausibly
+    // expect a final. Sub-1.5s sessions where had_speech flipped are
+    // almost always mistouches — the user tapped the hotkey, the RMS
+    // VAD (threshold ~-46 dBFS) briefly tripped on a key-click or
+    // ambient noise, and they released before any real speech landed.
+    // Reporting that as "识别失败" is worse than silent close, because
+    // there's nothing the user could have done differently.
+    const MISTOUCH_THRESHOLD_MS: u64 = 1500;
     if outcome.error.is_none()
         && !outcome.aborted
         && outcome.had_speech
         && outcome.finals.is_empty()
+        && outcome.duration_ms >= MISTOUCH_THRESHOLD_MS
     {
         outcome.error = Some((
             "未收到识别结果".to_string(),

@@ -12,10 +12,10 @@ import { AboutDialog } from "./components/AboutDialog";
 import { OnboardingDialog } from "./components/OnboardingDialog";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Settings as SettingsIcon, Copy, Trash2, Wifi, WifiOff } from "lucide-react";
+import { Settings as SettingsIcon, Copy, Trash2, Wifi, WifiOff, AlertCircle, Info, X } from "lucide-react";
 import { cn } from "./lib/utils";
 import { Tooltip } from "./components/ui/Tooltip";
-import { playStartSound, playStopSound, playErrorSound } from "./lib/sounds";
+import { playStartSound, playStopSound, playErrorSound, setCurrentSoundPresets } from "./lib/sounds";
 import { buildHotkeyString, keyToHotkeyName } from "./lib/hotkey";
 import { showOverlay, hideOverlay } from "./lib/overlay";
 import { applyThemeColor } from "./lib/theme-colors";
@@ -77,6 +77,9 @@ export interface AppSettings {
   esc_abort_enabled: boolean;
   silence_auto_stop_secs: number;
   vad_sensitivity: number;
+  sound_preset_start: string;
+  sound_preset_stop: string;
+  sound_preset_error: string;
 }
 
 interface TranscriptPayload {
@@ -173,6 +176,9 @@ const DEFAULT_SETTINGS: AppSettings = {
   esc_abort_enabled: true,
   silence_auto_stop_secs: 6,
   vad_sensitivity: 7,
+  sound_preset_start: "default-start",
+  sound_preset_stop: "default-stop",
+  sound_preset_error: "default-error",
 };
 
 /** Show "正在努力识别中" after the post-recording wait exceeds this. UX only. */
@@ -182,6 +188,23 @@ const ERROR_FLASH_MS = 2200;
 const MAX_LOG_ENTRIES = 200;
 const APP_LOG_PREFIX = "[APP]";
 const AI_LOG_PREFIX = "[AI]";
+
+/**
+ * Map a backend error reason (from `classify_error` in asr/mod.rs) to a
+ * short 4–6 character label suitable for the VoicePanel status row.
+ *
+ * The backend reasons are already localized but some ("语音服务连接失败，
+ * 检查网络后重试") are too long to fit in the status line without wrapping.
+ * We substring-match on the stable keywords instead of doing exact equality
+ * so future backend text tweaks won't silently fall back to "识别失败".
+ */
+function toShortErrorLabel(reason: string): string {
+  if (reason.includes("鉴权")) return "鉴权失败";
+  if (reason.includes("超时")) return "响应超时";
+  if (reason.includes("网络") || reason.includes("连接")) return "连接失败";
+  if (reason.includes("格式")) return "音频格式错误";
+  return "识别失败";
+}
 
 function formatLogTimestamp(date = new Date()): string {
   const pad = (value: number, width = 2) => String(value).padStart(width, "0");
@@ -243,6 +266,7 @@ export default function App() {
   const [settingsInitialTab, setSettingsInitialTab] = useState<string | undefined>();
   const closingRef = useRef(false);
   const [hasError, setHasError] = useState(false);
+  const [errorLabel, setErrorLabel] = useState<string | null>(null);
   const errorTimerRef = useRef<number | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [transcriptRefreshKey, setTranscriptRefreshKey] = useState(0);
@@ -361,6 +385,16 @@ export default function App() {
     localStorage.setItem("overlay-subtitle", settings.show_overlay_subtitle ? "1" : "0");
   }, [settings.show_overlay_subtitle]);
 
+  // Keep the sounds module's current presets in sync with settings so that
+  // playStartSound/playStopSound/playErrorSound use the user's selection.
+  useEffect(() => {
+    setCurrentSoundPresets({
+      start: settings.sound_preset_start,
+      stop: settings.sound_preset_stop,
+      error: settings.sound_preset_error,
+    });
+  }, [settings.sound_preset_start, settings.sound_preset_stop, settings.sound_preset_error]);
+
   useEffect(() => {
     const active = settings.esc_abort_enabled && (isRecording || isPostRecording || isOptimizing);
     invoke("set_escape_abort_active", { active }).catch(() => {});
@@ -418,17 +452,18 @@ export default function App() {
         playErrorSound();
         if (errorTimerRef.current !== null) window.clearTimeout(errorTimerRef.current);
         setHasError(true);
+        setErrorLabel("AI 优化失败");
         errorTimerRef.current = window.setTimeout(() => {
           setHasError(false);
+          setErrorLabel(null);
           errorTimerRef.current = null;
         }, 3000);
-        setBanner({
-          kind: "warning",
-          text: settingsRef.current.debug_mode
-            ? `AI 优化失败: ${e}，使用原始转写`
-            : "AI 优化失败，使用原始转写",
-        });
-        appendLocalLog("warn", "AI 优化失败，已回退到原始转写");
+        appendLocalLog(
+          "warn",
+          settingsRef.current.debug_mode
+            ? `AI 优化失败：${e}，回退到原始转写`
+            : "AI 优化失败，已回退到原始转写",
+        );
         // Fall back to pasting raw text (same guard: only if still current session)
         if (backendGenerationRef.current === generation && !forcedAbortRef.current) {
           invoke("send_text_input", { text: rawText }).catch(() => {});
@@ -499,6 +534,7 @@ export default function App() {
           // ── New session ─────────────────────────────────────────
           setBanner(null);
           setHasError(false);
+          setErrorLabel(null);
           if (errorTimerRef.current !== null) {
             window.clearTimeout(errorTimerRef.current);
             errorTimerRef.current = null;
@@ -661,19 +697,30 @@ export default function App() {
           }
 
           case "error": {
-            // Red waveform + error sound + banner. Show whatever finals
-            // the backend accumulated before the error — they're already
-            // persisted as a "partial" record.
+            // Red waveform + error sound + short label in VoicePanel. We
+            // deliberately don't open the global banner for session errors:
+            // the panel's status row (the same slot that shows "正在录音" /
+            // "识别中") is where the user is already looking, and a short
+            // contextual label ("连接失败" / "响应超时" / "鉴权失败" /
+            // "识别失败") conveys the outcome without dumping a multi-line
+            // technical string into the layout. The full detail still goes
+            // to the local log for debug mode / diagnosis. Partial finals
+            // the backend accumulated are already persisted as a "partial"
+            // record, so showing them below isn't destructive.
             const reason = error_reason ?? "语音识别出错";
             const detail = error_detail ?? reason;
-            const displayText = settingsRef.current.debug_mode ? detail : reason;
-            setBanner({ kind: "error", text: displayText });
-            appendLocalLog("error", `语音识别失败：${reason}`);
+            const shortLabel = toShortErrorLabel(reason);
+            appendLocalLog(
+              "error",
+              `语音识别失败：${reason}${detail && detail !== reason ? ` (${detail})` : ""}`,
+            );
             playErrorSound();
             if (errorTimerRef.current !== null) window.clearTimeout(errorTimerRef.current);
             setHasError(true);
+            setErrorLabel(shortLabel);
             errorTimerRef.current = window.setTimeout(() => {
               setHasError(false);
+              setErrorLabel(null);
               errorTimerRef.current = null;
             }, 3000);
             // Show any partial text so the user can see what was preserved
@@ -1063,33 +1110,56 @@ export default function App() {
       {/* Main Content — top-aligned fixed layout, no centering to prevent jumps */}
       <main className="flex-1 flex flex-col px-5 py-5 gap-4 overflow-hidden min-h-0">
         <div className="shrink-0 flex justify-center">
-          <VoicePanel isRecording={isRecording} isProcessing={isPostRecording && !isOptimizing} isProcessingSlow={isProcessingSlow} isOptimizing={isOptimizing} hasError={hasError} onToggle={handleToggleRecording} settings={settings} />
+          <VoicePanel isRecording={isRecording} isProcessing={isPostRecording && !isOptimizing} isProcessingSlow={isProcessingSlow} isOptimizing={isOptimizing} hasError={hasError} errorLabel={errorLabel} onToggle={handleToggleRecording} settings={settings} />
         </div>
 
-        {/* Error — smooth expand/collapse */}
+        {/* Banner — rare notification surface for settings/credential issues.
+            Session-level ASR errors are surfaced in the VoicePanel status row
+            instead (see `errorLabel`), so this slot usually stays collapsed. */}
         <div className={cn(
           "w-full grid shrink-0 transition-all duration-[var(--t-base)]",
           banner ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"
         )}>
           <div className="overflow-hidden">
             <div className={cn(
-              "px-4 py-3 rounded-xl text-sm select-text",
+              "flex items-start gap-2.5 pl-3 pr-2 py-2.5 rounded-lg border select-text",
+              "text-[13px] leading-relaxed tracking-[0.005em]",
               banner?.kind === "warning"
-                ? "bg-primary/10 text-primary"
-                : "bg-danger-muted text-danger-muted-fg"
+                ? "bg-primary/[0.06] border-primary/20 text-primary"
+                : "bg-danger-muted/70 border-danger/20 text-danger-muted-fg"
             )}>
-              {banner?.text}
-              {banner?.link && (
-                <>
-                  {" "}
-                  <button
-                    onClick={() => openUrl(banner.link!.url).catch(() => {})}
-                    className="underline underline-offset-2 hover:opacity-80 transition-opacity font-medium"
-                  >
-                    {banner.link.text}
-                  </button>
-                </>
-              )}
+              <span className="shrink-0 mt-0.5">
+                {banner?.kind === "warning"
+                  ? <Info size={14} />
+                  : <AlertCircle size={14} />}
+              </span>
+              <div className="flex-1 min-w-0 font-medium">
+                {banner?.text}
+                {banner?.link && (
+                  <>
+                    {" "}
+                    <button
+                      onClick={() => openUrl(banner.link!.url).catch(() => {})}
+                      className="underline underline-offset-2 hover:opacity-80 transition-opacity font-semibold"
+                    >
+                      {banner.link.text}
+                    </button>
+                  </>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => setBanner(null)}
+                aria-label="关闭提示"
+                className={cn(
+                  "shrink-0 p-1 -mr-0.5 rounded-md transition-all active:scale-95",
+                  banner?.kind === "warning"
+                    ? "text-primary/70 hover:text-primary hover:bg-primary/10"
+                    : "text-danger/70 hover:text-danger hover:bg-danger/10"
+                )}
+              >
+                <X size={13} />
+              </button>
             </div>
           </div>
         </div>

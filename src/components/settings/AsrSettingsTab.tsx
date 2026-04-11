@@ -3,9 +3,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutoStartEnabled } from "@tauri-apps/plugin-autostart";
-import { Eye, EyeOff, RefreshCw, Keyboard, Plus, Pencil, Trash2, ArrowRight, Check, X as XIcon, Mic } from "lucide-react";
+import { Eye, EyeOff, RefreshCw, Keyboard, Plus, Pencil, Trash2, ArrowRight, Check, X as XIcon, Mic, Play } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { THEME_PRESETS, applyThemeColor } from "../../lib/theme-colors";
+import { SOUND_OPTIONS, playSound, type SoundEvent } from "../../lib/sounds";
 import { buildHotkeyString, normalizeHotkeyString, validateHotkeyString } from "../../lib/hotkey";
 import { Tooltip } from "../ui/Tooltip";
 import { RadioIndicator } from "../ui/RadioGroup";
@@ -620,6 +621,58 @@ function MicLevelTester({ deviceName, isRecording }: { deviceName: string; isRec
   );
 }
 
+type SoundEventKey = "sound_preset_start" | "sound_preset_stop" | "sound_preset_error";
+
+const SOUND_EVENT_ROWS: Array<{
+  key: SoundEventKey;
+  event: SoundEvent;
+  label: string;
+}> = [
+  { key: "sound_preset_start", event: "start", label: "录音开始" },
+  { key: "sound_preset_stop",  event: "stop",  label: "录音结束" },
+  { key: "sound_preset_error", event: "error", label: "错误提示" },
+];
+
+function SoundEventRow({
+  row,
+  currentId,
+  onSelect,
+}: {
+  row: (typeof SOUND_EVENT_ROWS)[number];
+  currentId: string;
+  onSelect: (id: string) => void;
+}) {
+  const options = SOUND_OPTIONS[row.event].map((opt) => ({
+    label: opt.name,
+    value: opt.id,
+  }));
+
+  return (
+    <div className="flex items-center gap-2">
+      <span className="w-16 shrink-0 text-xs text-fg-3">{row.label}</span>
+      <div className="flex-1 min-w-0">
+        <Select
+          value={currentId}
+          options={options}
+          onChange={(id) => {
+            onSelect(id);
+            // Auto-preview on change, without mutating module state.
+            playSound(id, row.event);
+          }}
+        />
+      </div>
+      <button
+        type="button"
+        onClick={() => playSound(currentId, row.event)}
+        title="重新试听"
+        className="shrink-0 p-1.5 rounded-md text-fg-3 hover:text-fg-2 hover:bg-surface-subtle active:scale-95 transition-all"
+      >
+        <Play size={13} />
+      </button>
+    </div>
+  );
+}
+
 export function AsrSettingsTab({ form, handleChange, hotkeyError, onHotkeyChange, isRecording = false }: AsrSettingsTabProps) {
   const [showToken, setShowToken] = useState(false);
   const [devices, setDevices] = useState<string[]>([]);
@@ -670,66 +723,6 @@ export function AsrSettingsTab({ form, handleChange, hotkeyError, onHotkeyChange
 
   return (
     <div className="space-y-5">
-      {/* Appearance */}
-      <section>
-        <h3 className="text-xs font-semibold text-fg-3 uppercase tracking-widest mb-3">外观</h3>
-        <div className="space-y-3">
-          <div>
-            <label className="text-sm font-medium text-fg-2 mb-2 block">主题色</label>
-            <div className="flex flex-wrap gap-2">
-              {THEME_PRESETS.map((preset) => {
-                const isActive = form.theme_color === preset.id;
-                const isDark = document.documentElement.classList.contains("dark");
-                return (
-                  <button key={preset.id} type="button"
-                    onClick={() => {
-                      handleChange("theme_color", preset.id);
-                      applyThemeColor(preset.id, isDark, form.recording_follows_theme);
-                    }}
-                    className={cn(
-                      "w-7 h-7 rounded-full transition-all duration-[var(--t-fast)]",
-                      "hover:scale-110 active:scale-95",
-                      isActive
-                        ? "ring-2 ring-offset-2 ring-offset-surface"
-                        : "ring-1 ring-edge hover:ring-edge-strong"
-                    )}
-                    style={{
-                      backgroundColor: `hsl(${isDark ? preset.dark : preset.light})`,
-                      ...(isActive ? { boxShadow: `0 0 0 2px hsl(var(--bg)), 0 0 0 4px hsl(${isDark ? preset.dark : preset.light})` } : {}),
-                    }}
-                    title={preset.name}
-                  />
-                );
-              })}
-            </div>
-          </div>
-          <ToggleCard
-            checked={form.recording_follows_theme}
-            onChange={(v) => {
-              handleChange("recording_follows_theme", v);
-              const isDark = document.documentElement.classList.contains("dark");
-              applyThemeColor(form.theme_color, isDark, v);
-            }}
-            label="录音颜色跟随主题色"
-            description="关闭后录音状态保持红色"
-          />
-          <ToggleCard
-            checked={form.show_overlay}
-            onChange={(v) => handleChange("show_overlay", v)}
-            label="桌面悬浮窗"
-            description="录音时在桌面底部显示波形和转写文字"
-          />
-          {form.show_overlay && (
-            <ToggleCard
-              checked={form.show_overlay_subtitle}
-              onChange={(v) => handleChange("show_overlay_subtitle", v)}
-              label="显示字幕"
-              description="在悬浮窗上方显示实时转写文字"
-            />
-          )}
-        </div>
-      </section>
-
       {/* AI Provider */}
       <section>
         <h3 className="text-xs font-semibold text-fg-3 uppercase tracking-widest mb-3">AI 供应商</h3>
@@ -836,6 +829,66 @@ export function AsrSettingsTab({ form, handleChange, hotkeyError, onHotkeyChange
             </div>
           </div>
         )}
+      </section>
+
+      {/* Appearance */}
+      <section>
+        <h3 className="text-xs font-semibold text-fg-3 uppercase tracking-widest mb-3">外观</h3>
+        <div className="space-y-3">
+          <div>
+            <label className="text-sm font-medium text-fg-2 mb-2 block">主题色</label>
+            <div className="flex flex-wrap gap-2">
+              {THEME_PRESETS.map((preset) => {
+                const isActive = form.theme_color === preset.id;
+                const isDark = document.documentElement.classList.contains("dark");
+                return (
+                  <button key={preset.id} type="button"
+                    onClick={() => {
+                      handleChange("theme_color", preset.id);
+                      applyThemeColor(preset.id, isDark, form.recording_follows_theme);
+                    }}
+                    className={cn(
+                      "w-7 h-7 rounded-full transition-all duration-[var(--t-fast)]",
+                      "hover:scale-110 active:scale-95",
+                      isActive
+                        ? "ring-2 ring-offset-2 ring-offset-surface"
+                        : "ring-1 ring-edge hover:ring-edge-strong"
+                    )}
+                    style={{
+                      backgroundColor: `hsl(${isDark ? preset.dark : preset.light})`,
+                      ...(isActive ? { boxShadow: `0 0 0 2px hsl(var(--bg)), 0 0 0 4px hsl(${isDark ? preset.dark : preset.light})` } : {}),
+                    }}
+                    title={preset.name}
+                  />
+                );
+              })}
+            </div>
+          </div>
+          <ToggleCard
+            checked={form.recording_follows_theme}
+            onChange={(v) => {
+              handleChange("recording_follows_theme", v);
+              const isDark = document.documentElement.classList.contains("dark");
+              applyThemeColor(form.theme_color, isDark, v);
+            }}
+            label="录音颜色跟随主题色"
+            description="关闭后录音状态保持红色"
+          />
+          <ToggleCard
+            checked={form.show_overlay}
+            onChange={(v) => handleChange("show_overlay", v)}
+            label="桌面悬浮窗"
+            description="录音时在桌面底部显示波形和转写文字"
+          />
+          {form.show_overlay && (
+            <ToggleCard
+              checked={form.show_overlay_subtitle}
+              onChange={(v) => handleChange("show_overlay_subtitle", v)}
+              label="显示字幕"
+              description="在悬浮窗上方显示实时转写文字"
+            />
+          )}
+        </div>
       </section>
 
       {/* Audio Source */}
@@ -988,6 +1041,21 @@ export function AsrSettingsTab({ form, handleChange, hotkeyError, onHotkeyChange
             className="mt-2"
           />
         )}
+      </section>
+
+      {/* Sound Preset — compact dropdown per event, each with 6 options */}
+      <section>
+        <h3 className="text-xs font-semibold text-fg-3 uppercase tracking-widest mb-3">提示音</h3>
+        <div className="space-y-2">
+          {SOUND_EVENT_ROWS.map((row) => (
+            <SoundEventRow
+              key={row.key}
+              row={row}
+              currentId={form[row.key]}
+              onSelect={(id) => handleChange(row.key, id)}
+            />
+          ))}
+        </div>
       </section>
 
       {/* Input Settings */}

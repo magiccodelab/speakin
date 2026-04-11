@@ -177,6 +177,12 @@ pub struct AppSettings {
     pub silence_auto_stop_secs: u8,
     #[serde(default = "default_vad_sensitivity")]
     pub vad_sensitivity: u8,
+    #[serde(default = "default_sound_start")]
+    pub sound_preset_start: String,
+    #[serde(default = "default_sound_stop")]
+    pub sound_preset_stop: String,
+    #[serde(default = "default_sound_error")]
+    pub sound_preset_error: String,
 }
 
 fn default_true() -> bool {
@@ -189,6 +195,18 @@ fn default_silence_auto_stop_secs() -> u8 {
 
 fn default_vad_sensitivity() -> u8 {
     7
+}
+
+fn default_sound_start() -> String {
+    "default-start".to_string()
+}
+
+fn default_sound_stop() -> String {
+    "default-stop".to_string()
+}
+
+fn default_sound_error() -> String {
+    "default-error".to_string()
 }
 
 fn default_audio_source() -> String {
@@ -263,6 +281,9 @@ impl Default for AppSettings {
             esc_abort_enabled: true,
             silence_auto_stop_secs: default_silence_auto_stop_secs(),
             vad_sensitivity: default_vad_sensitivity(),
+            sound_preset_start: default_sound_start(),
+            sound_preset_stop: default_sound_stop(),
+            sound_preset_error: default_sound_error(),
         }
     }
 }

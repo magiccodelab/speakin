@@ -136,15 +136,38 @@
 
   body {
     font-family: 'DM Sans', system-ui, -apple-system, sans-serif;
-    background: hsl(var(--bg));
+    /* Body stays transparent so the rounded #root container below can clip
+     * the visible surface to curved corners. The actual background color
+     * is painted by #root (via the flash-prevention inline script in
+     * index.html + the App root div's `bg-surface` class). */
+    background: transparent;
     color: hsl(var(--fg));
     margin: 0;
     min-height: 100vh;
     overflow: hidden;
-    transition: background-color var(--t-base), color var(--t-base);
+    transition: color var(--t-base);
     /* 全局禁用文本选中 —— 桌面应用风格，避免误选 */
     user-select: none;
     -webkit-user-select: none;
+  }
+
+  /* Main window: round the #root container's corners. Works together with
+   * `"transparent": true` in tauri.conf.json so the four corner quadrants
+   * truly show the desktop underneath instead of a dark rectangle.
+   * The overlay window (html.overlay-window) already has its own rules
+   * below, and its #root stays unclipped. */
+  html:not(.overlay-window) #root {
+    border-radius: 14px;
+    overflow: hidden;
+    height: 100vh;
+  }
+
+  /* Theme-switch transition used to live on `body { background }` but
+   * moved here since body is now transparent. The App root div inside
+   * #root carries a CSS-variable-driven `bg-surface` that re-evaluates
+   * when the `.dark` class toggles — this rule smooths that change. */
+  html:not(.overlay-window) #root > div {
+    transition: background-color var(--t-base);
   }
 
   /* 表单控件与显式 select-text 容器仍允许选中 */
