@@ -348,17 +348,22 @@ impl AsrProvider for QwenProvider {
             &format!("→ 预缓冲发送 {} 包 ({} bytes)", packet_count, total_audio_bytes),
         );
 
-        // Stream live audio
+        // Stream live audio.
+        //
+        // `stop_requested` flips true ONLY when Phase 1 exits via `stop_rx`
+        // (user-initiated stop). It gates the Phase 2 drain stage below —
+        // other exit paths (Done/Error/channel-close) bypass drain.
         let mut error_opt: Option<String> = None;
         let mut done_received = false;
+        let mut stop_requested = false;
         loop {
             tokio::select! {
                 biased;
                 _ = &mut stop_rx => {
-                    net_log(&app_handle, "info", &format!(
-                        "停止录音 (共 {} 包, {} bytes, ~{:.1}s)",
-                        packet_count, total_audio_bytes, total_audio_bytes as f64 / 32000.0
-                    ));
+                    // Don't break silently — enter Phase 2 drain to consume
+                    // the 200-500ms of queued audio still sitting in
+                    // audio_rx (the actual cause of tail-end word loss).
+                    stop_requested = true;
                     break;
                 }
                 msg = reader_rx.recv() => {
@@ -420,6 +425,122 @@ impl AsrProvider for QwenProvider {
                     }
                 }
             }
+        }
+
+        // ── Phase 2: Drain stage (tail-end audio recovery) ──
+        //
+        // When Phase 1 exited via `stop_rx`, audio_rx may still contain
+        // 200-500ms of queued frames that were buffered while we awaited
+        // ws_write.send(). Pre-fix behavior broke out immediately and
+        // dropped them, cutting off the last 2-3 spoken characters.
+        //
+        // This phase keeps reading audio_rx for up to 500ms (or until the
+        // channel closes naturally after stop_forwarding drops the sender)
+        // and continues streaming packets to the server.
+        //
+        // NB: Do NOT treat `ReaderMsg::Done` as a termination signal here.
+        // We keep a unified pattern across all three providers — even
+        // though Qwen's Done IS a real terminal, ignoring it during drain
+        // just wastes at most the remaining 500ms, and the unified pattern
+        // protects against regressions if ReaderMsg semantics change
+        // (e.g. Doubao-style mid-session confirmations).
+        //
+        // Entry guard intentionally omits `!done_received` to match
+        // doubao.rs (see the long note there). For Qwen, Phase 1 Done
+        // always breaks immediately, so `stop_requested=false` and we
+        // skip Phase 2 naturally — no regression from that removal.
+        if stop_requested && error_opt.is_none() {
+            let drain_deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_millis(500);
+            net_log(&app_handle, "info", "收到停止信号，开始排空音频队列...");
+
+            // Tracks whether the reader channel has already closed.
+            // Once true, the `reader_rx.recv()` arm below is disabled via
+            // `if !reader_closed`. Without this guard, `recv()` on a
+            // closed channel returns `None` immediately, and the biased
+            // select would repeatedly take the reader arm, starving
+            // `audio_rx` and defeating the whole drain (P1 bug caught by
+            // `/codex:review`).
+            let mut reader_closed = false;
+
+            loop {
+                // ESC abort: skip drain grace period. Does NOT shorten the
+                // 5s wait-for-session-finished below — separate concern.
+                if aborted.load(Ordering::Acquire) {
+                    break;
+                }
+
+                tokio::select! {
+                    biased;
+
+                    _ = tokio::time::sleep_until(drain_deadline) => break,
+
+                    msg = reader_rx.recv(), if !reader_closed => {
+                        match msg {
+                            Some(ReaderMsg::Final(text)) => outcome.finals.push(text),
+                            Some(ReaderMsg::Error(detail)) => {
+                                error_opt = Some(detail);
+                                break;
+                            }
+                            // Ignore Done/SessionReady during drain — see note above.
+                            Some(ReaderMsg::Done) => {}
+                            Some(ReaderMsg::SessionReady) => {}
+                            // Reader exited but audio_rx may still have
+                            // frames. Mark the channel as closed so we
+                            // stop polling it, and keep draining audio
+                            // until audio_rx closes or the deadline hits.
+                            None => {
+                                reader_closed = true;
+                            }
+                        }
+                    }
+
+                    frame = audio_rx.recv() => {
+                        match frame {
+                            Some(frame) => {
+                                let _ = app_handle.emit("audio-level", frame.level);
+                                buffer.extend_from_slice(&frame.pcm);
+
+                                while buffer.len() >= chunk_size {
+                                    let b64 = BASE64.encode(&buffer[..chunk_size]);
+                                    let msg = serde_json::json!({
+                                        "event_id": format!("evt_audio_{}", event_counter),
+                                        "type": "input_audio_buffer.append",
+                                        "audio": b64
+                                    });
+                                    event_counter += 1;
+
+                                    if ws_write
+                                        .send(Message::text(msg.to_string()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        net_log(&app_handle, "error", "→ 发送音频包失败 (drain)");
+                                        error_opt = Some("音频发送失败".to_string());
+                                        break;
+                                    }
+                                    buffer.drain(..chunk_size);
+                                    packet_count += 1;
+                                    total_audio_bytes += chunk_size;
+                                }
+                                if error_opt.is_some() { break; }
+                            }
+                            None => break, // channel closed — natural drain end
+                        }
+                    }
+                }
+            }
+
+            net_log(
+                &app_handle,
+                "info",
+                &format!(
+                    "停止录音 (共 {} 包, {} bytes, ~{:.1}s)",
+                    packet_count,
+                    total_audio_bytes,
+                    total_audio_bytes as f64 / 32000.0
+                ),
+            );
         }
 
         if error_opt.is_none() && !done_received {

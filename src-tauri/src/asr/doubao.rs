@@ -479,17 +479,22 @@ impl AsrProvider for DoubaoProvider {
         // exited). `error_opt` is populated when the reader reports an
         // error — in that case we break out of the loop immediately
         // without bothering to send more audio or a final packet.
+        //
+        // `stop_requested` flips true ONLY when Phase 1 exits via `stop_rx`
+        // (user-initiated stop). It gates the Phase 2 drain stage below —
+        // other exit paths (Done/Error/channel-close) bypass drain.
         let mut done_received = false;
         let mut error_opt: Option<String> = None;
+        let mut stop_requested = false;
         loop {
             tokio::select! {
                 biased;
 
                 _ = &mut stop_rx => {
-                    net_log(&app_handle, "info", &format!(
-                        "停止录音 (共发送 {} 包, {} bytes, ~{:.1}s)",
-                        packet_count, total_audio_bytes, total_audio_bytes as f64 / 32000.0
-                    ));
+                    // Don't break silently — enter Phase 2 drain to consume
+                    // the 200-500ms of queued audio still sitting in
+                    // audio_rx (the actual cause of tail-end word loss).
+                    stop_requested = true;
                     break;
                 }
                 msg = reader_rx.recv() => {
@@ -560,6 +565,131 @@ impl AsrProvider for DoubaoProvider {
                     }
                 }
             }
+        }
+
+        // ── Phase 2: Drain stage (tail-end audio recovery) ──
+        //
+        // When Phase 1 exited via `stop_rx`, audio_rx may still contain
+        // 200-500ms of queued frames that were buffered while we awaited
+        // ws_write.send(). Pre-fix behavior broke out immediately and
+        // dropped them, cutting off the last 2-3 spoken characters.
+        //
+        // This phase keeps reading audio_rx for up to 500ms (or until the
+        // channel closes naturally after stop_forwarding drops the sender)
+        // and continues streaming packets to the server.
+        //
+        // NB: Do NOT treat `ReaderMsg::Done` as a termination signal here.
+        // Doubao's bi-stream mode sends Done mid-session as a two-pass
+        // confirmation, so breaking on Done would defeat the drain in
+        // exactly the mode we're trying to fix. Only `Error` breaks early
+        // (pointless to keep sending after server error).
+        //
+        // Entry guard deliberately does NOT check `!done_received`.
+        // In bi-stream mode `done_received` can already be true from a
+        // mid-session two-pass confirmation (Phase 1 Done arm flips the
+        // flag without breaking). Gating on `!done_received` here would
+        // skip the drain for exactly the bi-stream users this patch is
+        // trying to fix. For nostream/dashscope/qwen, Phase 1 Done always
+        // breaks immediately, so `stop_requested=false` and we naturally
+        // skip Phase 2 — no regression from the removed guard.
+        if stop_requested && error_opt.is_none() {
+            let drain_deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_millis(500);
+            net_log(&app_handle, "info", "收到停止信号，开始排空音频队列...");
+
+            // Tracks whether the reader channel has already closed.
+            // Once true, the `reader_rx.recv()` arm below is disabled via
+            // `if !reader_closed`. Without this guard, `recv()` on a
+            // closed channel returns `None` immediately, and the biased
+            // select would repeatedly take the reader arm, starving
+            // `audio_rx` and defeating the whole drain (P1 bug caught by
+            // `/codex:review`).
+            let mut reader_closed = false;
+
+            loop {
+                // ESC abort: skip drain grace period. Does NOT shorten the
+                // 5s wait-for-FINAL below — that is a separate concern.
+                if aborted.load(Ordering::Acquire) {
+                    break;
+                }
+
+                tokio::select! {
+                    biased;
+
+                    _ = tokio::time::sleep_until(drain_deadline) => break,
+
+                    msg = reader_rx.recv(), if !reader_closed => {
+                        match msg {
+                            Some(ReaderMsg::Final(text)) => outcome.finals.push(text),
+                            Some(ReaderMsg::Error(detail)) => {
+                                error_opt = Some(detail);
+                                break;
+                            }
+                            // Ignore Done during drain — see comment above.
+                            Some(ReaderMsg::Done) => {}
+                            // Reader exited but audio_rx may still have
+                            // frames. Mark the channel as closed so we
+                            // stop polling it, and keep draining audio
+                            // until audio_rx closes or the deadline hits.
+                            None => {
+                                reader_closed = true;
+                            }
+                        }
+                    }
+
+                    frame = audio_rx.recv() => {
+                        match frame {
+                            Some(frame) => {
+                                let _ = app_handle.emit("audio-level", frame.level);
+
+                                buffer.extend_from_slice(&frame.pcm);
+                                while buffer.len() >= chunk_size {
+                                    let packet = match protocol::build_audio_request(&buffer[..chunk_size], false) {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            error_opt = Some(format!("音频打包失败: {}", e));
+                                            buffer.clear();
+                                            break;
+                                        }
+                                    };
+                                    total_audio_bytes += chunk_size;
+                                    packet_count += 1;
+                                    buffer.drain(..chunk_size);
+
+                                    if ws_write.send(Message::Binary(packet.into())).await.is_err() {
+                                        net_log(&app_handle, "error", "→ 发送音频包失败 (drain)");
+                                        // Surface the failure instead of
+                                        // silently looping until deadline.
+                                        // Phase 1's doubao loop tolerates
+                                        // this silently, but drain is a
+                                        // tail-recovery fast path — if we
+                                        // can't write, we should stop
+                                        // immediately and let the caller
+                                        // see the transport error.
+                                        error_opt = Some("音频发送失败 (drain)".to_string());
+                                        break;
+                                    }
+                                }
+                                if error_opt.is_some() {
+                                    break;
+                                }
+                            }
+                            None => break, // channel closed — natural drain end
+                        }
+                    }
+                }
+            }
+
+            net_log(
+                &app_handle,
+                "info",
+                &format!(
+                    "停止录音 (共发送 {} 包, {} bytes, ~{:.1}s)",
+                    packet_count,
+                    total_audio_bytes,
+                    total_audio_bytes as f64 / 32000.0
+                ),
+            );
         }
 
         // If the reader reported an error, don't waste time sending the
